@@ -638,18 +638,61 @@ if ! VLLM_USE_PRECOMPILED=1 uv pip install \
 fi
 echo "[info] deps installed"
 
+# Bundle-path setup for CUDA shared libs. The PyTorch CUDA wheels
+# install a tree of `nvidia/<pkg>/lib/` directories inside the venv's
+# site-packages -- for cu129 that's `nvidia/cu13/lib/libcudart.so.13`
+# (CUDA 13 runtime), `nvidia/cu13/lib/libnvrtc.so.13`, and various
+# cu12 helper libs (cublas, cufft, curand, cusparse, etc.). The
+# dynamic linker doesn't search those paths by default, and vLLM's
+# `_C_stable_libtorch.so` links `libcudart.so.13` directly -- so
+# without this, the first `import vllm` raises
+# `ImportError: libcudart.so.13: cannot open shared object file`.
+#
+# We walk the venv's site-packages, collect every `nvidia/*/lib`
+# directory that actually exists, and prepend them to LD_LIBRARY_PATH.
+# Doing it via a glob (rather than hard-coding paths) means this also
+# picks up future nvidia-* packages without code changes.
+_nvidia_lib_paths=""
+# Resolve `${VENV}/lib` from the installed python rather than guessing.
+# On CPython 3.10+ this is `lib/python3.X/site-packages/`; on older
+# layouts (or `uv venv --relocatable`) it can be `lib/site-packages/`.
+# The discovery loop below uses `*/site-packages` so either works.
+_venv_lib_root="$("${VENV_DIR}/bin/python" -c 'import sys, os; p=os.path.dirname(os.path.dirname(sys.executable)); print(os.path.join(p, "lib"))' 2>/dev/null || true)"
+if [[ -n "${_venv_lib_root}" && -d "${_venv_lib_root}" ]]; then
+    # CPython 3.11 uses `python3.11/` directly; CPython 3.10 used
+    # `python3.10/`; the `*/site-packages` glob below handles both.
+    while IFS= read -r _nvidia_lib; do
+        if [[ -n "${_nvidia_lib_paths}" ]]; then
+            _nvidia_lib_paths="${_nvidia_lib}:${_nvidia_lib_paths}"
+        else
+            _nvidia_lib_paths="${_nvidia_lib}"
+        fi
+    done < <(find "${_venv_lib_root}" -maxdepth 5 -type d -path '*/nvidia/*/lib' 2>/dev/null | sort -u)
+fi
+if [[ -n "${_nvidia_lib_paths}" ]]; then
+    export LD_LIBRARY_PATH="${_nvidia_lib_paths}:${LD_LIBRARY_PATH:-}"
+    echo "[info] LD_LIBRARY_PATH prepended with $(echo "${_nvidia_lib_paths}" | tr ':' '\n' | wc -l) nvidia lib dirs (e.g. libcudart.so.13, libnvrtc.so.13, libcublas.so.12)"
+else
+    echo "[warn] no nvidia/*/lib dirs found under ${_venv_lib_root}; libcudart.so.13 may be missing at import time"
+fi
+unset _nvidia_lib_paths _venv_lib_root _nvidia_lib
+
 # Final venv sanity check. We capture and print the actual import
 # error (rather than swallowing it with `2>/dev/null`) so a future
-# failure points at the root cause immediately.
-if ! python3 -c \
+# failure points at the root cause immediately. We use the venv's
+# python explicitly (not bare `python3`) so we never accidentally
+# fall back to the module-loaded EasyBuild Python if PATH ever loses
+# its venv prefix.
+if ! "${VENV_DIR}/bin/python" -c \
     "import vllm, numpy, datasets; print(f'vllm={vllm.__version__} numpy={numpy.__version__} datasets={datasets.__version__}')" \
     >"${VENV_DIR}/sanity.out" 2>&1; then
     echo "[fatal] venv is broken; uv pip install reported success but the sanity import failed." >&2
     echo "[fatal] import output:" >&2
     sed 's/^/  /' "${VENV_DIR}/sanity.out" >&2
-    echo "[fatal] most common cause: --torch-backend=auto pulled a CPU-only torch/vllm," >&2
-    echo "[fatal] so vllm._C_stable_libtorch is missing. Re-submit with TORCH_BACKEND" >&2
-    echo "[fatal] set explicitly (default: cu129, matching the torch==2.13.0 pin in pyproject.toml)." >&2
+    echo "[fatal] common causes:" >&2
+    echo "[fatal]   - ${TORCH_BACKEND} wheel links a CUDA runtime (e.g. libcudart.so.13) that isn't on LD_LIBRARY_PATH. The fix above should have prepended the venv's nvidia/*/lib paths; if not, check that the cu${TORCH_BACKEND#cu}/lib subdir exists under the venv's site-packages." >&2
+    echo "[fatal]   - the editable install landed in a different Python than ${VENV_DIR}/bin/python; verify with: ls -la ${VENV_DIR}/bin/python*" >&2
+    echo "[fatal]   - the module-loaded EasyBuild Python (${PYTHON_MODULE}) is shadowing the venv; explicitly call \${VENV_DIR}/bin/python instead of bare python3." >&2
     exit 4
 fi
 cat "${VENV_DIR}/sanity.out"
@@ -683,7 +726,13 @@ echo "[$(date -Iseconds)] running: python examples/eval-moe/moe_expert_stats.py 
 echo "============================================================"
 
 cd "${REPO_ROOT}"
-python3 examples/eval-moe/moe_expert_stats.py "${RUN_ARGS[@]}"
+# Use the venv's python explicitly. `source activate` already put it
+# at the front of PATH, but if anything between the activate and here
+# rewrote PATH (e.g. a stray module load), `python3` could resolve to
+# the EasyBuild Python instead, which has its own (different) vllm
+# install AND doesn't have libcudart.so.13 on its loader path. Using
+# the absolute path makes the analyzer invocation independent of PATH.
+"${VENV_DIR}/bin/python" examples/eval-moe/moe_expert_stats.py "${RUN_ARGS[@]}"
 
 echo "============================================================"
 echo "[$(date -Iseconds)] vllm-moe-eval finished (rc=$?)"
