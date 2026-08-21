@@ -210,7 +210,19 @@ download_one() {
 
     echo "[info] ${repo_id}: downloading -> ${cache_dir} ..."
 
-    if ! python3 - "${repo_id}" "${CACHE_DIR}" $(printf -- '--include %q ' "${INCLUDE_PATTERNS[@]}") >>"${log}" 2>&1 <<'PY'
+    # Pass the include globs via env var to avoid shell-quoting bugs
+    # (printf '%q ' on an empty array produces the literal "''" which
+    # snapshot_download then treats as a glob and matches nothing).
+    # DELIMITED_INCLUDE_PATTERNS is one glob per line; an empty string
+    # means "download everything".
+    if [[ ${#INCLUDE_PATTERNS[@]} -gt 0 ]]; then
+        DELIMITED_INCLUDE_PATTERNS="$(printf '%s\n' "${INCLUDE_PATTERNS[@]}")"
+        export DELIMITED_INCLUDE_PATTERNS
+    else
+        unset DELIMITED_INCLUDE_PATTERNS
+    fi
+
+    if ! python3 - "${repo_id}" "${CACHE_DIR}" >>"${log}" 2>&1 <<'PY'
 import os
 import sys
 
@@ -218,27 +230,23 @@ from huggingface_hub import snapshot_download
 
 repo_id = sys.argv[1]
 cache_dir = sys.argv[2]
-extra = sys.argv[3:]
 
-kwargs = {"cache_dir": cache_dir, "allow_patterns": None}
-i = 0
-while i < len(extra):
-    flag = extra[i]
-    val = extra[i + 1]
-    if flag == "--include":
-        # Multiple --include flags are additive; huggingface_hub accepts
-        # a single list of globs, so we accumulate.
-        if kwargs["allow_patterns"] is None:
-            kwargs["allow_patterns"] = []
-        kwargs["allow_patterns"].append(val)
-    i += 2
+# Patterns are passed one-per-line via env var (set by the caller)
+# to side-step shell-quoting bugs. An unset / empty env var means
+# "no filter - download everything".
+include_env = os.environ.get("DELIMITED_INCLUDE_PATTERNS", "")
+allow_patterns = None
+if include_env.strip():
+    allow_patterns = [p for p in include_env.splitlines() if p]
+
+kwargs = {"cache_dir": cache_dir, "allow_patterns": allow_patterns}
 
 # Pass through HF_TOKEN if set.
 if "HF_TOKEN" in os.environ:
     kwargs["token"] = os.environ["HF_TOKEN"]
 
 print(f"  cache_dir = {cache_dir}", flush=True)
-print(f"  allow_patterns = {kwargs['allow_patterns']}", flush=True)
+print(f"  allow_patterns = {allow_patterns}", flush=True)
 
 path = snapshot_download(repo_id, **kwargs)
 print(f"  -> {path}", flush=True)

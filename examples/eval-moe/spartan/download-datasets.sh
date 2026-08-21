@@ -187,20 +187,33 @@ from datasets import load_dataset
 extra = sys.argv[3:]
 
 kwargs = {}
-positional = []
+splits = []
 i = 0
+# Walk argv token-by-token: any `--flag` consumes the next non-flag
+# token as its value. A token starting with `--` that is followed by
+# another flag (or end-of-args) is silently skipped (the previous
+# parser crashed with IndexError in that case; we now ignore it).
 while i < len(extra):
     flag = extra[i]
-    val = extra[i + 1]
-    if flag == "--subset":
-        kwargs["name"] = val
+    if flag == "--subset" and i + 1 < len(extra) and not extra[i + 1].startswith("--"):
+        kwargs["name"] = extra[i + 1]
+        i += 2
+    elif flag == "--split" and i + 1 < len(extra) and not extra[i + 1].startswith("--"):
+        splits.append(extra[i + 1])
+        i += 2
     elif flag == "--split":
-        positional.append(val)
-    i += 2
+        # `--split` without a following value: skip the flag itself.
+        i += 1
+    else:
+        # Unknown / stray token: skip it (don't crash the parser).
+        i += 1
+
+if not splits:
+    sys.exit("no `--split` arguments reached the python helper; check the shell quoting in download_one()")
 
 # `name` (subset) is fixed across splits; load each split independently
 # so we get one directory per split under out_dir.
-for split in positional:
+for split in splits:
     print(f"  - downloading split={split!r} ...")
     ds = load_dataset(hf_id, split=split, **kwargs)
     ds.save_to_disk(f"{out_dir}/{split}")
@@ -223,6 +236,7 @@ download_bbh_subtasks() {
     local log="$3"
 
     python3 - "${hf_id}" "${out_dir}" >>"${log}" 2>&1 <<'PY' || return $?
+import os
 import sys
 from datasets import get_dataset_config_names, load_dataset
 
@@ -234,14 +248,18 @@ print(f"  - {len(configs)} sub-tasks: {configs}")
 for cfg in configs:
     cfg_dir = f"{out_dir}/{cfg}"
     split_dir = f"{cfg_dir}/test"
-    try:
-        # Idempotency: skip configs whose test split already exists.
-        from datasets import Dataset
-        Dataset.load_from_disk(split_dir)
+    # Idempotency: a previously-downloaded sub-task has both an Arrow
+    # metadata file and at least one data shard. We check for the
+    # marker files explicitly instead of catching a broad Exception
+    # around Dataset.load_from_disk - the broad-except version silently
+    # swallowed real errors (corrupt cache, permission denied) and
+    # kept re-downloading on every run.
+    if (
+        os.path.isfile(os.path.join(split_dir, "dataset_info.json"))
+        and os.path.isdir(os.path.join(split_dir, "data"))
+    ):
         print(f"  - {cfg}: already cached, skip")
         continue
-    except Exception:
-        pass
     print(f"  - {cfg}: downloading ...")
     ds = load_dataset(hf_id, cfg, split="test")
     ds.save_to_disk(split_dir)

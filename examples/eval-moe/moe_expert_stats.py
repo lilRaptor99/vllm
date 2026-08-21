@@ -584,9 +584,19 @@ def main() -> None:
 
             # Free GPU memory before the next cell so two models don't
             # have to fit in VRAM simultaneously. vLLM's LLM class
-            # exposes .llm_engine / .engine; both are torn down by GC
-            # here.
+            # does not expose a public shutdown() - we have to rely on
+            # GC + an explicit empty_cache() call. Without the cache
+            # flush, the next cell's LLM(...) would OOM even though
+            # `del llm` cleared the Python reference, because PyTorch's
+            # caching allocator holds onto the freed blocks.
+            import gc
+
+            import torch
+
             del llm
+            gc.collect()
+            if torch.accelerator.is_available():
+                torch.accelerator.empty_cache()
 
     logger.info("All %d cell(s) complete; tree at %s", n_cells, output_dir)
 
