@@ -54,12 +54,22 @@
 #   CUDA_MODULE     Lmod module name for CUDA     (default: CUDA/12.4.1)
 #   PYTHON_MODULE   Lmod module name for Python   (default: Python/3.11.3)
 #   GCC_MODULE      Lmod module name for GCC      (default: GCCcore/11.3.0)
-#   TORCH_BACKEND   uv --torch-backend tag         (default: cu124)
-#                                                  Matches the module-loaded CUDA major.minor.
-#                                                  E.g. cu118 for CUDA/11.8.x. Setting this
-#                                                  explicitly (instead of `auto`) is what
-#                                                  stops uv from silently pulling a
-#                                                  CPU-only torch + vllm.
+#   TORCH_BACKEND   uv --torch-backend tag         (default: cu129)
+#                                                  Matches a PyTorch CUDA wheel index that
+#                                                  contains the torch version pinned in
+#                                                  pyproject.toml's [build-system].requires
+#                                                  (torch==2.13.0 at time of writing).
+#                                                  cu124 maxes at torch 2.6.0, so the
+#                                                  default is cu129 (the only index that
+#                                                  publishes torch 2.13.0 today). The
+#                                                  wheel is forward-compatible with the
+#                                                  CUDA 12.4.1 driver/runtime on Spartan
+#                                                  as long as `nvidia-smi` reports CUDA
+#                                                  >= 12.9. Override with e.g. cu118 for
+#                                                  CUDA/11.8.x if your node has it, BUT
+#                                                  you'll then need a vllm branch whose
+#                                                  pyproject pins a torch version that
+#                                                  exists in that index.
 #   NCCL_MODULE     Lmod module name for NCCL     (default: <unset>)
 #                                                  Auto-detected from `module avail NCCL/`
 #                                                  by matching the loaded CUDA major.minor.
@@ -136,10 +146,15 @@ mkdir -p "${SLURM_SUBMIT_DIR}/spartan/logs"
 CUDA_MODULE="${CUDA_MODULE:-CUDA/12.4.1}"
 PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.3}"
 GCC_MODULE="${GCC_MODULE:-GCCcore/11.3.0}"
-# uv's `--torch-backend` tag for the module-loaded CUDA major.minor
-# version. cu124 matches CUDA/12.4.x. Override if your partition ships
-# a different CUDA (e.g. cu118 for CUDA/11.8.x).
-TORCH_BACKEND="${TORCH_BACKEND:-cu124}"
+# uv's `--torch-backend` tag. MUST point at a PyTorch index that
+# publishes the torch version pinned in pyproject.toml's
+# [build-system].requires (currently torch==2.13.0). cu124 maxes at
+# torch 2.6.0; cu128 maxes at torch 2.11.0; only cu129 publishes
+# torch 2.13.0 today. The wheel's runtime is forward-compatible with
+# CUDA 12.4.1 toolkits as long as `nvidia-smi` reports driver CUDA
+# >= 12.9. Override with cu118 / cu126 / etc. ONLY if your vllm
+# branch's pyproject pins a torch version that exists in that index.
+TORCH_BACKEND="${TORCH_BACKEND:-cu129}"
 # NCCL_MODULE is auto-detected (probed from `module avail NCCL/`)
 # but NOT loaded by default. Loaded automatically when NGPUS > 1,
 # since vLLM's tensor-parallel engine needs NCCL for cross-GPU
@@ -359,6 +374,11 @@ fi
 echo "[info] python: $(python3 --version)"
 echo "[info] gcc   : $(gcc --version | head -1)"
 echo "[info] nvcc  : $(nvcc --version 2>/dev/null | tail -1 || echo '<not on PATH>')"
+# Capture the active Python version once (e.g. 3.11 -> "311") so the
+# torch-wheel preflight below can build the cp${X}-cp${X} substring
+# that matches PyTorch's manylinux wheel filenames.
+PYTHON_VER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "")"
+PYTHON_VER_NO_DOT="$(python3 -c 'import sys; print("%d%d" % sys.version_info[:2])' 2>/dev/null || echo "")"
 
 # Make sure C++ sees the loaded GCC and that nvcc is on PATH.
 export CC="${CC:-$(command -v gcc)}"
@@ -455,9 +475,21 @@ if [[ ! -f "${REPO_ROOT}/examples/eval-moe/moe_expert_stats.py" ]]; then
     exit 2
 fi
 
-# 2. Quick CUDA sanity check.
+# 2. Quick CUDA sanity check. We print both the toolkit version
+#    (from `nvcc --version`, controlled by ${CUDA_MODULE}) and the
+#    driver version (from `nvidia-smi`, baked into the node's kernel
+#    modules). PyTorch wheels are built against a specific CUDA
+#    version (cu${X} = the toolkit the wheel was compiled with) but
+#    require a driver CUDA >= that version at runtime -- so the
+#    driver version is what actually has to be >= ${TORCH_BACKEND}'s
+#    cu-major.minor.
 if command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
+    _drv_cuda="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)"
+    if [[ -n "${_drv_cuda}" ]]; then
+        echo "[info] nvidia driver (supports CUDA runtime up to): ${_drv_cuda}"
+    fi
+    unset _drv_cuda
 else
     echo "[warn] nvidia-smi not found on PATH; CUDA may not be active"
 fi
@@ -543,6 +575,43 @@ fi
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 
+# Preflight: confirm the torch version pinned in pyproject.toml's
+# [build-system].requires is actually published on the chosen
+# PyTorch index. The full install below would otherwise fail with
+# `Because there is no version of torch==2.13.0 and you require
+# torch==2.13.0, we can conclude that your requirements are
+# unsatisfiable.` -- which is correct, but only AFTER `uv` has spent
+# ~30s resolving 200+ transitive packages. Doing the check up-front
+# saves the wasted time AND lets us print an actionable error
+# pointing at the right TORCH_BACKEND value.
+_pin_probe="$(awk -F '"' '/^requires/ {flag=1; next} flag && /"torch *==/ {gsub(/[", ]/, "", $2); print $2; exit} flag && /^]/ {exit}' \
+    "${REPO_ROOT}/pyproject.toml" 2>/dev/null || true)"
+_pin_ver="${_pin_probe##*==}"
+if [[ -n "${_pin_ver}" && "${_pin_ver}" != "${_pin_probe}" ]]; then
+    # The pytorch.org simple index URL for --torch-backend=<TAG> is
+    # https://download.pytorch.org/whl/<TAG>/torch/. Fetch the index
+    # page and look for a wheel filename matching the pinned version.
+    # We avoid HEAD requests (some CDNs return 403) and just parse the
+    # HTML index page, which PyTorch always serves.
+    _index_url="https://download.pytorch.org/whl/${TORCH_BACKEND}/torch/"
+    _hits="$(curl -fsSL --max-time 15 "${_index_url}" 2>/dev/null \
+        | grep -oE "torch-${_pin_ver//./\\.}\\+${TORCH_BACKEND}-cp${PYTHON_VER_NO_DOT}-cp${PYTHON_VER_NO_DOT}-manylinux_2_28_x86_64\\.whl" \
+        | head -1 || true)"
+    if [[ -z "${_hits}" ]]; then
+        echo "[fatal] pyproject.toml pins torch==${_pin_ver}, but the ${TORCH_BACKEND} PyTorch index has no such wheel for cp${PYTHON_VER_NO_DOT} (Python ${PYTHON_VER})." >&2
+        echo "[fatal]   searched: ${_index_url}" >&2
+        echo "[fatal] Most likely causes:" >&2
+        echo "[fatal]   - ${TORCH_BACKEND} is wrong for this vllm branch (cu124 maxes at torch 2.6.0; cu128 maxes at 2.11.0; only cu129 publishes torch 2.13.0 today)." >&2
+        echo "[fatal]   - this vllm checkout pins a torch version that doesn't exist on any PyTorch index (then you need an older vllm or a torch index patch)." >&2
+        echo "[fatal] Fix: re-submit with TORCH_BACKEND set to the tag whose index publishes torch==${_pin_ver}. See https://download.pytorch.org/whl/" >&2
+        exit 4
+    fi
+    echo "[info] pyproject pins torch==${_pin_ver}; ${TORCH_BACKEND} index has the cp${PYTHON_VER_NO_DOT} wheel. Continuing."
+    unset _pin_probe _pin_ver _index_url _hits
+else
+    unset _pin_probe _pin_ver
+fi
+
 # Make sure the analyzer's hard dependencies are present. The CRITICAL
 # one is vLLM: we install it editable from $REPO_ROOT with
 # VLLM_USE_PRECOMPILED=1 so the prebuilt CUDA wheels land in the venv
@@ -580,7 +649,7 @@ if ! python3 -c \
     sed 's/^/  /' "${VENV_DIR}/sanity.out" >&2
     echo "[fatal] most common cause: --torch-backend=auto pulled a CPU-only torch/vllm," >&2
     echo "[fatal] so vllm._C_stable_libtorch is missing. Re-submit with TORCH_BACKEND" >&2
-    echo "[fatal] set explicitly (default: cu124, matching CUDA/12.4.x)." >&2
+    echo "[fatal] set explicitly (default: cu129, matching the torch==2.13.0 pin in pyproject.toml)." >&2
     exit 4
 fi
 cat "${VENV_DIR}/sanity.out"
