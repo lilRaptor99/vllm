@@ -77,7 +77,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=120G
-#SBATCH --time=4-00:00:00
+#SBATCH --time=0-03:55:00
 #SBATCH --output=spartan/logs/vllm-moe-eval-%j.out
 #SBATCH --error=spartan/logs/vllm-moe-eval-%j.err
 #SBATCH --mail-type=ALL
