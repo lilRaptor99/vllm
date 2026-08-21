@@ -72,7 +72,13 @@ python examples/eval-moe/moe_expert_stats.py --help
 | `--max-model-len`          | `4096`                              | vLLM `max_model_len` setting.                                                                                                                                                                                    |
 | `--dtype`                  | `auto`                              | vLLM dtype.                                                                                                                                                                                                      |
 | `--gpu-memory-utilization` | `0.92`                              | vLLM GPU memory fraction.                                                                                                                                                                                        |
-| `--enforce-eager`          | (off)                               | Force eager-mode execution (skip CUDA graphs).                                                                                                                                                                   |
+
+<!-- markdownlint-disable MD060 -->
+
+| `--enforce-eager` | (off) | Force eager-mode execution (skip CUDA graphs). |
+| `--tensor-parallel-size` | `1` | Number of GPUs for vLLM's tensor-parallel engine. For multi-GPU runs, the Spartan wrapper loads an NCCL module, prints the NVLink topology, and forwards this flag automatically (`--gres=gpu:N` → `--tensor-parallel-size N`). |
+
+<!-- markdownlint-enable MD060 -->
 
 ## Output schema
 

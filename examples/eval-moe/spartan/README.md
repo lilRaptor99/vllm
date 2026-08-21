@@ -131,7 +131,27 @@ sbatch --export=ALL,MODELS_OVERRIDE="allenai/OLMoE-1B-7B-0924-Instruct LiteLLMs/
 # Smaller subset for a smoke test:
 sbatch --export=ALL,BENCHMARKS=mmlu,NUM_SAMPLES=32,MAX_TOKENS=64 \
     spartan/vllm-moe-eval.sbatch
+
+# Multi-GPU (e.g. 2x A100 with NVLink on the same node) — `--gres` is
+# the SBATCH directive and `NGPUS` is the runtime var the analyzer
+# reads; they MUST match:
+sbatch --gres=gpu:2 --export=ALL,NGPUS=2 \
+    spartan/vllm-moe-eval.sbatch
+
+# Multi-GPU with an explicit tensor split (e.g. 70/30 split across
+# 2 GPUs because GPU-0 has more free memory):
+sbatch --gres=gpu:2 --export=ALL,NGPUS=2,EXTRA_TENSOR_SPLIT="70,30" \
+    spartan/vllm-moe-eval.sbatch
 ```
+
+The `.sbatch` only loads the NCCL module when `NGPUS > 1` (vLLM's
+single-GPU engine doesn't need it). For multi-GPU runs it also runs
+`nvidia-smi topo -m` to print the interconnect topology — NVLink
+shows as `NV*`, NVSwitch as `SYS`, and PCIe/NVL as `PIX`/`PXB`. If
+your partition only has PCIe, set `SPLIT_MODE=tensor` or
+`SPLIT_MODE=layer` depending on whether you'd rather pipeline
+activations (lower memory) or shard weights (more memory for
+larger models).
 
 If the venv install fails on the GPU node with a network error (pypi
 unreachable), the .sbatch will exit with `[fatal] uv pip install failed`
@@ -146,7 +166,7 @@ The .sbatch creates `${SCRATCH_BASE}/venv` on first run, then runs
 VLLM_USE_PRECOMPILED=1 uv pip install \
     --python "${VENV_DIR}/bin/python" \
     numpy datasets -e "${REPO_ROOT}" \
-    --torch-backend=auto
+    --torch-backend=cu124
 ```
 
 The `VLLM_USE_PRECOMPILED=1` flag pulls vLLM's prebuilt CUDA wheels
@@ -206,25 +226,33 @@ You should see:
 All variables are optional. Set them before `sbatch` (or pass via
 `--export=...`).
 
-| Variable             | Default                                                                            | Notes                                                                                                                                                                                                                               |
-| -------------------- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `REPO_ROOT`          | `/data/gpfs/projects/uom00014/vllm`                                                | Where the repo is cloned                                                                                                                                                                                                            |
-| `SCRATCH_BASE`       | `/data/scratch/projects/uom00014/vllm` (or `${SCRATCH}/vllm` if `$SCRATCH` is set) | Root for venv / datasets / results / hf_cache                                                                                                                                                                                       |
-| `CUDA_MODULE`        | `CUDA/12.4.1`                                                                      | Lmod module name (canonical gpu-a100-short default)                                                                                                                                                                                 |
-| `PYTHON_MODULE`      | `Python/3.11.3`                                                                    | Lmod module name (canonical gpu-a100-short default)                                                                                                                                                                                 |
-| `GCC_MODULE`         | `GCCcore/11.3.0`                                                                   | Lmod module name; **must be the older compiler family** that Python/3.11.3 is built against, not the newer GCC/13.3.0                                                                                                               |
-| `MODELS_OVERRIDE`    | `allenai/OLMoE-1B-7B-0924-Instruct`                                                | Space-separated HF model ids. Each model gets its own LLM instance and routed-experts capture buffer.                                                                                                                               |
-| `QUANTS_OVERRIDE`    | `<unset>`                                                                          | Space-separated vLLM quantization methods (e.g. `awq`, `fp8`, `gptq`, `bitsandbytes`). Cells are evaluated as `MODELS_OVERRIDE` × `QUANTS_OVERRIDE` (Cartesian product). Pass an empty token (or leave unset) to skip quantization. |
-| `BENCHMARKS`         | `mmlu bbh humaneval`                                                               | Space-separated subset                                                                                                                                                                                                              |
-| `NUM_SAMPLES`        | `256`                                                                              | Prompts per benchmark                                                                                                                                                                                                               |
-| `MAX_TOKENS`         | `256`                                                                              | Generation length per prompt                                                                                                                                                                                                        |
-| `MAX_MODEL_LEN`      | `4096`                                                                             | vLLM `max_model_len` setting                                                                                                                                                                                                        |
-| `GPU_MEM_UTIL`       | `0.92`                                                                             | vLLM `gpu_memory_utilization`                                                                                                                                                                                                       |
-| `ENFORCE_EAGER`      | `<unset>`                                                                          | If set, pass `--enforce-eager` to `LLM(...)` (skip CUDA graphs)                                                                                                                                                                     |
-| `OUTPUT_DIR`         | `${SCRATCH_BASE}/results`                                                          | Where to write per-benchmark JSON files                                                                                                                                                                                             |
-| `SEED`               | `0`                                                                                | Sampler + sampling seed                                                                                                                                                                                                             |
-| `HF_TOKEN`           | `<unset>`                                                                          | Optional; for gated repos                                                                                                                                                                                                           |
-| `SKIP_DATASET_CHECK` | `0`                                                                                | `1` = skip the dataset preflight warning                                                                                                                                                                                            |
+<!-- markdownlint-disable MD060 -->
+
+| Variable             | Default                                                                            | Notes                                                                                                                                                                                                                                                    |
+| -------------------- | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REPO_ROOT`          | `/data/gpfs/projects/uom00014/vllm`                                                | Where the repo is cloned                                                                                                                                                                                                                                 |
+| `SCRATCH_BASE`       | `/data/scratch/projects/uom00014/vllm` (or `${SCRATCH}/vllm` if `$SCRATCH` is set) | Root for venv / datasets / results / hf_cache                                                                                                                                                                                                            |
+| `CUDA_MODULE`        | `CUDA/12.4.1`                                                                      | Lmod module name (canonical gpu-a100-short default)                                                                                                                                                                                                      |
+| `PYTHON_MODULE`      | `Python/3.11.3`                                                                    | Lmod module name (canonical gpu-a100-short default)                                                                                                                                                                                                      |
+| `GCC_MODULE`         | `GCCcore/11.3.0`                                                                   | Lmod module name; **must be the older compiler family** that Python/3.11.3 is built against, not the newer GCC/13.3.0                                                                                                                                    |
+| `NCCL_MODULE`        | `<auto-detected>`                                                                  | Lmod module name for NCCL. The preflight walks `module avail NCCL/`, picks the build matching `${CUDA_MODULE}` (prefers the one marked `(D)`), and loads it automatically when `NGPUS > 1`. Override before sbatch to pin a specific build.              |
+| `NGPUS`              | `1`                                                                                | Number of GPUs the job uses. Must match `#SBATCH --gres=gpu:N` (that directive can't reference shell vars). Forwarded to vLLM as `--tensor-parallel-size`.                                                                                               |
+| `SPLIT_MODE`         | `layer`                                                                            | vLLM's distributed-executor mode. `layer` = pipeline parallel; `tensor`/`row` = weight parallel (slower over PCIe without NVLink); `none` = single-GPU on a multi-GPU box.                                                                               |
+| `EXTRA_TENSOR_SPLIT` | `<unset>`                                                                          | Comma-separated weights for vLLM's `--tensor-split` (e.g. `50,50` for 2 GPUs, `25,25,25,25` for 4). When unset AND `NGPUS > 1`, the preflight auto-derives a uniform split so the model actually spreads layers instead of falling back to all-on-GPU-0. |
+| `MODELS_OVERRIDE`    | `allenai/OLMoE-1B-7B-0924-Instruct`                                                | Space-separated HF model ids. Each model gets its own LLM instance and routed-experts capture buffer.                                                                                                                                                    |
+| `QUANTS_OVERRIDE`    | `<unset>`                                                                          | Space-separated vLLM quantization methods (e.g. `awq`, `fp8`, `gptq`, `bitsandbytes`). Cells are evaluated as `MODELS_OVERRIDE` × `QUANTS_OVERRIDE` (Cartesian product). Pass an empty token (or leave unset) to skip quantization.                      |
+| `BENCHMARKS`         | `mmlu bbh humaneval`                                                               | Space-separated subset                                                                                                                                                                                                                                   |
+| `NUM_SAMPLES`        | `256`                                                                              | Prompts per benchmark                                                                                                                                                                                                                                    |
+| `MAX_TOKENS`         | `256`                                                                              | Generation length per prompt                                                                                                                                                                                                                             |
+| `MAX_MODEL_LEN`      | `4096`                                                                             | vLLM `max_model_len` setting                                                                                                                                                                                                                             |
+| `GPU_MEM_UTIL`       | `0.92`                                                                             | vLLM `gpu_memory_utilization`                                                                                                                                                                                                                            |
+| `ENFORCE_EAGER`      | `<unset>`                                                                          | If set, pass `--enforce-eager` to `LLM(...)` (skip CUDA graphs)                                                                                                                                                                                          |
+| `OUTPUT_DIR`         | `${SCRATCH_BASE}/results`                                                          | Where to write per-benchmark JSON files                                                                                                                                                                                                                  |
+| `SEED`               | `0`                                                                                | Sampler + sampling seed                                                                                                                                                                                                                                  |
+| `HF_TOKEN`           | `<unset>`                                                                          | Optional; for gated repos                                                                                                                                                                                                                                |
+| `SKIP_DATASET_CHECK` | `0`                                                                                | `1` = skip the dataset preflight warning                                                                                                                                                                                                                 |
+
+<!-- markdownlint-enable MD060 -->
 
 ---
 

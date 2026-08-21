@@ -54,6 +54,37 @@
 #   CUDA_MODULE     Lmod module name for CUDA     (default: CUDA/12.4.1)
 #   PYTHON_MODULE   Lmod module name for Python   (default: Python/3.11.3)
 #   GCC_MODULE      Lmod module name for GCC      (default: GCCcore/11.3.0)
+#   TORCH_BACKEND   uv --torch-backend tag         (default: cu124)
+#                                                  Matches the module-loaded CUDA major.minor.
+#                                                  E.g. cu118 for CUDA/11.8.x. Setting this
+#                                                  explicitly (instead of `auto`) is what
+#                                                  stops uv from silently pulling a
+#                                                  CPU-only torch + vllm.
+#   NCCL_MODULE     Lmod module name for NCCL     (default: <unset>)
+#                                                  Auto-detected from `module avail NCCL/`
+#                                                  by matching the loaded CUDA major.minor.
+#                                                  Loaded automatically when NGPUS > 1
+#                                                  (vLLM's tensor-parallel engine needs NCCL
+#                                                  for cross-GPU collectives). Override
+#                                                  before sbatch if the probe picks the
+#                                                  wrong build.
+#   NGPUS           number of GPUs the job uses   (default: 1)
+#                                                  Must match `#SBATCH --gres=gpu:N` (that
+#                                                  directive can't reference shell vars).
+#                                                  Forwarded to vLLM as
+#                                                  `--tensor-parallel-size ${NGPUS}`.
+#   SPLIT_MODE      vLLM distributed-executor mode (default: layer)
+#                                                  "layer" = pipeline parallel across GPUs;
+#                                                  "tensor" / "row" = weight parallel (slower
+#                                                  over PCIe without NVLink); "none" = single
+#                                                  GPU mode regardless of allocation.
+#   EXTRA_TENSOR_SPLIT  comma-separated fraction  (default: <unset>)
+#                                                  Forwarded to vLLM as `--tensor-split`.
+#                                                  e.g. "50,50" for 2 GPUs, "25,25,25,25"
+#                                                  for 4. Unset = auto-derive a uniform
+#                                                  split so multi-GPU actually spreads
+#                                                  layers instead of falling back to
+#                                                  all-on-GPU-0.
 #   MODELS_OVERRIDE space-separated HF model ids (default: allenai/OLMoE-1B-7B-0924-Instruct)
 #                                                  Cells are evaluated as MODELS x QUANTS.
 #   QUANTS_OVERRIDE space-separated vLLM quant tags (default: unset = no quant)
@@ -72,6 +103,9 @@
 #                                                  (default: 0)
 
 # ---------------------------------------------------------------- SLURM
+# IMPORTANT: `#SBATCH --gres=gpu:N` cannot use a shell variable, so
+# edit the value below AND keep NGPUS in sync (the body uses NGPUS
+# to auto-derive the tensor split, etc.). Default 1 = single GPU.
 #SBATCH --job-name=vllm-moe-eval
 #SBATCH --partition=gpu-a100-short
 #SBATCH --gres=gpu:1
@@ -102,6 +136,28 @@ mkdir -p "${SLURM_SUBMIT_DIR}/spartan/logs"
 CUDA_MODULE="${CUDA_MODULE:-CUDA/12.4.1}"
 PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.3}"
 GCC_MODULE="${GCC_MODULE:-GCCcore/11.3.0}"
+# uv's `--torch-backend` tag for the module-loaded CUDA major.minor
+# version. cu124 matches CUDA/12.4.x. Override if your partition ships
+# a different CUDA (e.g. cu118 for CUDA/11.8.x).
+TORCH_BACKEND="${TORCH_BACKEND:-cu124}"
+# NCCL_MODULE is auto-detected (probed from `module avail NCCL/`)
+# but NOT loaded by default. Loaded automatically when NGPUS > 1,
+# since vLLM's tensor-parallel engine needs NCCL for cross-GPU
+# collectives. Override before sbatch if the probe picks the wrong one.
+NCCL_MODULE="${NCCL_MODULE:-}"
+# Number of GPUs the job requests. Mirrors `#SBATCH --gres=gpu:`;
+# update both together.
+NGPUS="${NGPUS:-1}"
+# vLLM `--split-mode` for tensor parallelism (forwarded to LLM as
+# `distributed_executor_backend` for some paths, or to the engine).
+# "layer" shards layers across GPUs (pipeline parallel);
+# "row" / "tensor" do weight-parallel sharding (slower over PCIe).
+SPLIT_MODE="${SPLIT_MODE:-layer}"
+# Comma-separated fraction list summing to ~1.0 (e.g. "50,50" for 2
+# GPUs). Empty = auto-derive a uniform split so multi-GPU actually
+# uses the GPUs. Set to "none" to force single-GPU on a multi-GPU
+# allocation (useful for A/B testing).
+EXTRA_TENSOR_SPLIT="${EXTRA_TENSOR_SPLIT:-}"
 
 REPO_ROOT="${REPO_ROOT:-/data/gpfs/projects/uom00014/vllm}"
 SCRATCH_BASE="${SCRATCH_BASE:-${SCRATCH:-/data/scratch/projects/uom00014}/vllm}"
@@ -136,7 +192,7 @@ echo "[$(date -Iseconds)] vllm-moe-eval starting"
 echo "[$(date -Iseconds)] job_id        = ${SLURM_JOB_ID:-}"
 echo "[$(date -Iseconds)] node          = ${SLURM_JOB_NODELIST:-}"
 echo "[$(date -Iseconds)] cpus          = ${SLURM_CPUS_PER_TASK:-}"
-echo "[$(date -Iseconds)] gpus          = ${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "[$(date -Iseconds)] gpus          = ${CUDA_VISIBLE_DEVICES:-<unset>} (NGPUS=${NGPUS})"
 echo "[$(date -Iseconds)] REPO_ROOT     = ${REPO_ROOT}"
 echo "[$(date -Iseconds)] SCRATCH_BASE  = ${SCRATCH_BASE}"
 echo "[$(date -Iseconds)] HF_HOME       = ${HF_CACHE}"
@@ -153,6 +209,10 @@ echo "[$(date -Iseconds)] SEED          = ${SEED}"
 echo "[$(date -Iseconds)] CUDA_MODULE   = ${CUDA_MODULE}"
 echo "[$(date -Iseconds)] PYTHON_MODULE = ${PYTHON_MODULE}"
 echo "[$(date -Iseconds)] GCC_MODULE    = ${GCC_MODULE}"
+echo "[$(date -Iseconds)] TORCH_BACKEND = ${TORCH_BACKEND}"
+echo "[$(date -Iseconds)] NCCL_MODULE   = ${NCCL_MODULE:-<auto-probed below>}"
+echo "[$(date -Iseconds)] SPLIT_MODE    = ${SPLIT_MODE}"
+echo "[$(date -Iseconds)] EXTRA_TENSOR_SPLIT = ${EXTRA_TENSOR_SPLIT:-<auto-derived for NGPUS=${NGPUS}>}"
 echo "============================================================"
 
 # ---------------------------------------------------------------- modules
@@ -198,6 +258,91 @@ load_module_or_die "${CUDA_MODULE}"
 module list
 set -u
 
+# Auto-detect the default NCCL module that matches the loaded CUDA.
+# `module avail NCCL/...-CUDA-<X>.<Y>` typically lays modules out in
+# 3 columns per line, so we have to scan each whitespace-separated
+# token individually rather than rely on awk on the whole line.
+# Prefers the default version (the one Lmod marks with `(D)`) when
+# multiple builds match. Echoes the picked module name to stdout;
+# empty output means no match found.
+#
+# Implementation note: bash's `[[ ... =~ ... ]]` regex has subtle
+# quoting rules when the pattern contains variables, so we use
+# `grep -E` for portable, predictable matching.
+#
+# Usage:
+#     nccl="$(auto_nccl_for_cuda CUDA/12.4.1)"
+auto_nccl_for_cuda() {
+    local cuda_mod="$1"
+    # CUDA/12.4.1 -> 12.4 (major.minor)
+    local cuda_ver="${cuda_mod#CUDA/}"
+    cuda_ver="${cuda_ver%.*}"
+    local avail_out
+    avail_out="$(module avail NCCL/ 2>/dev/null || true)"
+    local first_match="" default_match=""
+    local line tok prev_match_tok
+    while IFS= read -r line; do
+        # Skip lines that don't contain any NCCL/ token.
+        [[ "${line}" == *"NCCL/"* ]] || continue
+        # Walk the whitespace-separated tokens. We track
+        # `prev_match_tok` = the most recently seen NCCL/... token
+        # whose name matched our CUDA version regex. When a "(D)"
+        # token appears AFTER such a token, we retroactively promote
+        # that matched token to `default_match`.
+        prev_match_tok=""
+        for tok in ${line}; do
+            if [[ "${tok}" == "(D)" ]]; then
+                # If the previous matching token exists and we
+                # haven't already promoted one, promote it now.
+                if [[ -n "${prev_match_tok}" && -z "${default_match}" ]]; then
+                    default_match="${prev_match_tok}"
+                    prev_match_tok=""  # consumed
+                fi
+                continue
+            fi
+            local stripped="${tok%*(D)}"
+            # Match e.g. NCCL/2.22.3-CUDA-12.4.1 - the trailing dot
+            # before the patch number is mandatory so we don't
+            # accidentally pick up a build with the same major.minor
+            # but for a different CUDA (CUDA-12.4 vs CUDA-12.4.1).
+            if ! echo "${stripped}" | grep -qE "NCCL/[^ ]*-CUDA-${cuda_ver//./\\.}\\.[0-9]"; then
+                # Non-NCCL/non-(D) token (e.g. UCX-CUDA/...). Reset
+                # the prev_match_tok so a later (D) doesn't promote
+                # something across a non-NCCL entry.
+                prev_match_tok=""
+                continue
+            fi
+            # Glued-on (D) marker: e.g. NCCL/X(D) is one token. We
+            # already stripped it above, so we know it's the match.
+            if [[ "${tok}" == *"(D)"* && -z "${default_match}" ]]; then
+                default_match="${stripped}"
+                prev_match_tok=""
+                continue
+            fi
+            if [[ -z "${first_match}" ]]; then
+                first_match="${stripped}"
+            fi
+            prev_match_tok="${stripped}"
+        done
+    done <<<"${avail_out}"
+    if [[ -n "${default_match}" ]]; then
+        printf '%s\n' "${default_match}"
+    elif [[ -n "${first_match}" ]]; then
+        printf '%s\n' "${first_match}"
+    fi
+}
+# If the user set NCCL_MODULE explicitly, respect it. Otherwise probe
+# the available NCCL builds and pick the one matching ${CUDA_MODULE}.
+if [[ -z "${NCCL_MODULE}" ]]; then
+    probed_nccl="$(auto_nccl_for_cuda "${CUDA_MODULE}")"
+    if [[ -n "${probed_nccl}" ]]; then
+        NCCL_MODULE="${probed_nccl}"
+        echo "[info] auto-detected NCCL_MODULE=${NCCL_MODULE} for ${CUDA_MODULE} (not loaded by default - opt in with NCCL_MODULE on the sbatch command line)"
+    else
+        echo "[info] no NCCL/...-CUDA-${CUDA_MODULE#CUDA/} found via 'module avail' - skipping (vLLM doesn't need NCCL on a single-GPU job)"
+    fi
+fi
+
 # Post-load sanity check: make sure the binaries we expect are actually
 # on PATH.
 if ! command -v python3 >/dev/null 2>&1; then
@@ -227,6 +372,64 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:${CUDA_HOME:-/usr/local/cuda}/lib64
 # OpenMP: per the Spartan docs, set OMP_NUM_THREADS to match the SLURM
 # requested CPUs so multi-threaded math libraries don't oversubscribe.
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+
+# ------------------------------------------- multi-GPU / NVLink handling
+# Only relevant when NGPUS > 1. vLLM's tensor-parallel engine needs
+# NCCL for cross-GPU collectives. We load the auto-detected NCCL
+# module here (the auto-detect probe runs above). If the probe
+# couldn't find an NCCL module but the user asked for multi-GPU, we
+# fatal out with a clear message.
+if [[ "${NGPUS}" -gt 1 ]]; then
+    if [[ -z "${NCCL_MODULE}" ]]; then
+        echo "[fatal] NGPUS=${NGPUS} > 1 but no NCCL module is available for ${CUDA_MODULE}." >&2
+        echo "[fatal] Run on a login node: module avail NCCL/ to find one, then export NCCL_MODULE=<name> before sbatch." >&2
+        exit 5
+    fi
+    echo "[info] loading NCCL module ${NCCL_MODULE} (NGPUS=${NGPUS} requires it for cross-GPU collectives) ..."
+    load_module_or_die "${NCCL_MODULE}"
+    # EasyBuild exposes NCCL's install prefix via ${EBROOTNCCL}; set
+    # both NCCL_HOME (which llama.cpp's FindNCCL looks at) and add
+    # lib to LD_LIBRARY_PATH so runtime dlopen works too.
+    if [[ -n "${EBROOTNCCL:-}" ]]; then
+        export NCCL_HOME="${NCCL_HOME:-${EBROOTNCCL}}"
+        export LD_LIBRARY_PATH="${NCCL_HOME}/lib:${LD_LIBRARY_PATH}"
+    fi
+    echo "[info] nccl: EBROOTNCCL=${EBROOTNCCL:-<unset>}  NCCL_HOME=${NCCL_HOME:-<unset>}"
+
+    # Probe GPU topology via nvidia-smi topo -m. NVLink between GPUs
+    # gives ~600 GB/s tensor-parallel BW on A100; PCIe only gives
+    # ~32 GB/s and is generally too slow for >70B models. We log the
+    # result so a future failure is easier to diagnose; vLLM doesn't
+    # expose a per-tensor-parallel-mode switch at the Python level
+    # but the choice of split-mode below matters.
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+        echo "[info] GPU topology probe:"
+        nvidia-smi topo -m 2>/dev/null | head -n "$((NGPUS + 1))" || true
+        # Auto-set EXTRA_TENSOR_SPLIT when the user didn't pass one
+        # AND we have multiple GPUs to spread across. We compute a
+        # uniform split: 50/50 for 2 GPUs, 25/25/25/25 for 4, etc.
+        if [[ -z "${EXTRA_TENSOR_SPLIT}" && "${SPLIT_MODE}" != "none" ]]; then
+            _auto_frac="$(awk -v n="${NGPUS}" 'BEGIN{ printf "%.4f", 100.0/n }')"
+            _auto_split=""
+            _auto_i=0
+            while [[ ${_auto_i} -lt ${NGPUS} ]]; do
+                _auto_split+="${_auto_frac}"
+                _auto_i=$(( _auto_i + 1 ))
+                [[ ${_auto_i} -lt ${NGPUS} ]] && _auto_split+=","
+            done
+            EXTRA_TENSOR_SPLIT="${_auto_split}"
+            echo "[info] auto-derived EXTRA_TENSOR_SPLIT=${EXTRA_TENSOR_SPLIT} for NGPUS=${NGPUS}"
+            unset _auto_frac _auto_split _auto_i
+        fi
+    fi
+
+    # vLLM's V1 engine spins up its own process group internally;
+    # we don't need to set RANK / WORLD_SIZE manually here.
+else
+    # Single-GPU: skip NCCL + tensor split entirely.
+    :
+fi
 
 # ----------------------------------------------- HF cache for the analyzer
 # vLLM's HF resolver reads $HF_HOME (and $HUGGINGFACE_HUB_CACHE) before
@@ -305,12 +508,18 @@ fi
 # 4. Ensure a venv exists with vllm + numpy + datasets. We create the
 #    venv on the SCRATCH volume (not in the repo) so it survives across
 #    job submissions. If a usable venv already exists we reuse it;
-#    otherwise we create one and pip install vllm into it.
+#    otherwise we create one and uv-pip-install vllm into it.
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
     echo "[info] creating venv at ${VENV_DIR} ..."
-    # --system-site-packages lets us reuse the module-loaded Python's
-    # CUDA-aware numpy/scipy wheels without re-downloading them.
-    python3 -m venv --system-site-packages "${VENV_DIR}"
+    # NB: deliberately NOT --system-site-packages. On Spartan the
+    # module-loaded Python/3.11.3 bundles its own `torch` + `vllm` in
+    # /apps/easybuild-..., and `--system-site-packages` would let
+    # those leak into our venv ahead of the editable install - so
+    # `import vllm` inside the venv would resolve to the EasyBuild
+    # copy (which may not match the editable source we just installed).
+    # A clean venv + `uv pip install --torch-backend=cu124` (below)
+    # gives us a self-contained venv with the right CUDA torch.
+    python3 -m venv "${VENV_DIR}"
     echo "[info] venv created"
 fi
 # Always re-export PATH so the rest of the script picks up the venv's
@@ -342,23 +551,39 @@ source "${VENV_DIR}/bin/activate"
 # `numpy` and `datasets` are pure-Python and are added to the same
 # `uv pip install` so they're all version-aligned in the lockfile.
 echo "[info] installing vllm + numpy + datasets from $REPO_ROOT (editable) ..."
+# --torch-backend=${TORCH_BACKEND} pulls torch/torchvision/torchaudio
+# from pytorch.org's CUDA-X.Y index (matches the module-loaded CUDA).
+# --torch-backend=auto would look at the existing torch on PATH and
+# pick that - which on a fresh venv is the CPU-only PyPI wheel,
+# leading to a CPU-only vllm install and the well-known
+# `No module named 'vllm._C_stable_libtorch'` import error.
 if ! VLLM_USE_PRECOMPILED=1 uv pip install \
         --python "${VENV_DIR}/bin/python" \
         "numpy" \
         "datasets" \
         -e "${REPO_ROOT}" \
-        --torch-backend=auto 2>"${VENV_DIR}/install.err"; then
+        --torch-backend="${TORCH_BACKEND}" 2>"${VENV_DIR}/install.err"; then
     echo "[fatal] uv pip install failed:" >&2
     sed 's/^/  /' "${VENV_DIR}/install.err" >&2
     exit 4
 fi
 echo "[info] deps installed"
 
-# Final venv sanity check.
-if ! python3 -c "import vllm, numpy, datasets; print(f'vllm={vllm.__version__} numpy={numpy.__version__} datasets={datasets.__version__}')" 2>/dev/null; then
-    echo "[fatal] venv is broken; pip install reported success but import failed" >&2
+# Final venv sanity check. We capture and print the actual import
+# error (rather than swallowing it with `2>/dev/null`) so a future
+# failure points at the root cause immediately.
+if ! python3 -c \
+    "import vllm, numpy, datasets; print(f'vllm={vllm.__version__} numpy={numpy.__version__} datasets={datasets.__version__}')" \
+    >"${VENV_DIR}/sanity.out" 2>&1; then
+    echo "[fatal] venv is broken; uv pip install reported success but the sanity import failed." >&2
+    echo "[fatal] import output:" >&2
+    sed 's/^/  /' "${VENV_DIR}/sanity.out" >&2
+    echo "[fatal] most common cause: --torch-backend=auto pulled a CPU-only torch/vllm," >&2
+    echo "[fatal] so vllm._C_stable_libtorch is missing. Re-submit with TORCH_BACKEND" >&2
+    echo "[fatal] set explicitly (default: cu124, matching CUDA/12.4.x)." >&2
     exit 4
 fi
+cat "${VENV_DIR}/sanity.out"
 
 # ---------------------------------------------------------------- run
 # Compose the analyzer's argv. Each ${VAR:+...} guard means the flag
@@ -375,6 +600,7 @@ RUN_ARGS=(
     --output-dir "${OUTPUT_DIR}"
     --seed "${SEED}"
     --dtype "auto"
+    --tensor-parallel-size "${NGPUS}"
 )
 if [[ -n "${QUANTS_OVERRIDE}" ]]; then
     RUN_ARGS+=( --quant ${QUANTS_OVERRIDE} )

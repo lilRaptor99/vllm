@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -316,6 +317,7 @@ def _build_llm(
     gpu_memory_utilization: float,
     enforce_eager: bool,
     seed: int,
+    tensor_parallel_size: int = 1,
 ) -> Any:
     """Instantiate a fresh vLLM `LLM` for one (model, quant) cell.
 
@@ -323,6 +325,11 @@ def _build_llm(
     empty string to skip (vLLM's own default is `None`). Each cell
     gets its own KV cache so the slot buffer that backs
     `enable_return_routed_experts` is scoped to this model+quant.
+
+    `tensor_parallel_size` is forwarded as vLLM's `tensor_parallel_size`.
+    vLLM automatically picks the right distributed executor based on
+    the visible GPUs (multi-GPU + NVLink uses the V1 engine's
+    tensor-parallel path; single-GPU is a no-op).
     """
     from vllm import LLM
 
@@ -334,6 +341,7 @@ def _build_llm(
         "gpu_memory_utilization": gpu_memory_utilization,
         "enforce_eager": enforce_eager,
         "seed": seed,
+        "tensor_parallel_size": tensor_parallel_size,
     }
     if quant:
         kwargs["quantization"] = quant
@@ -492,6 +500,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.92)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of GPUs to spread each model across (vLLM's "
+            "tensor_parallel_size). Default 1. Set to NGPUS from the "
+            "sbatch to use the full GPU allocation. NVLink between "
+            "GPUs gives ~600 GB/s tensor parallel BW; PCIe gives "
+            "~32 GB/s and is generally too slow for 70B+ models."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -543,6 +563,7 @@ def main() -> None:
                 gpu_memory_utilization=args.gpu_memory_utilization,
                 enforce_eager=args.enforce_eager,
                 seed=args.seed,
+                tensor_parallel_size=args.tensor_parallel_size,
             )
 
             cell_dir = _cell_dir(output_dir, model, quant)
@@ -582,19 +603,31 @@ def main() -> None:
             )
             logger.info("Wrote %s", cell_dir / "summary.json")
 
-            # Free GPU memory before the next cell so two models don't
-            # have to fit in VRAM simultaneously. vLLM's LLM class
-            # does not expose a public shutdown() - we have to rely on
-            # GC + an explicit empty_cache() call. Without the cache
-            # flush, the next cell's LLM(...) would OOM even though
-            # `del llm` cleared the Python reference, because PyTorch's
-            # caching allocator holds onto the freed blocks.
+            # Free GPU memory + tear down torch.distributed before the
+            # next cell so two models don't have to fit in VRAM
+            # simultaneously. vLLM's LLM class does not expose a
+            # public shutdown() - we have to rely on GC + an explicit
+            # empty_cache() call. Without the cache flush, the next
+            # cell's LLM(...) would OOM even though `del llm` cleared
+            # the Python reference, because PyTorch's caching
+            # allocator holds onto the freed blocks. On multi-GPU
+            # runs, vLLM's LLMEngine also spins up a torch.distributed
+            # process group; we destroy it explicitly here so the
+            # next cell can spin up a fresh one with a different
+            # world_size.
             import gc
 
             import torch
 
             del llm
             gc.collect()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                # `destroy_process_group` is best-effort cleanup; some
+                # versions raise if no group was ever created. We use
+                # contextlib.suppress rather than try/except/pass to
+                # satisfy ruff's SIM105 and to make the intent clear.
+                with contextlib.suppress(Exception):
+                    torch.distributed.destroy_process_group()
             if torch.accelerator.is_available():
                 torch.accelerator.empty_cache()
 
