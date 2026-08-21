@@ -134,14 +134,32 @@ sbatch --export=ALL,BENCHMARKS=mmlu,NUM_SAMPLES=32,MAX_TOKENS=64 \
 ```
 
 If the venv install fails on the GPU node with a network error (pypi
-unreachable), the .sbatch will exit with `[fatal] pip install failed`
+unreachable), the .sbatch will exit with `[fatal] uv pip install failed`
 and a clear stderr dump. The preflight installs to the venv under
 `${SCRATCH_BASE}/venv`, which is cached between submissions; the
-second run skips the heavy `pip install vllm` step entirely.
+second run skips the heavy `uv pip install -e . --torch-backend=auto`
+step entirely.
 
-The .sbatch creates `${SCRATCH_BASE}/venv` on first run, installs
-`vllm` + `numpy` + `datasets` into it via `pip`, then invokes
-`examples/eval-moe/moe_expert_stats.py` with the configured argv.
+The .sbatch creates `${SCRATCH_BASE}/venv` on first run, then runs
+
+```bash
+VLLM_USE_PRECOMPILED=1 uv pip install \
+    --python "${VENV_DIR}/bin/python" \
+    numpy datasets -e "${REPO_ROOT}" \
+    --torch-backend=auto
+```
+
+The `VLLM_USE_PRECOMPILED=1` flag pulls vLLM's prebuilt CUDA wheels
+instead of recompiling from source (~5 min vs ~30 min on A100 nodes);
+`--torch-backend=auto` selects the right torch CUDA build; `-e .`
+installs the local `${REPO_ROOT}` checkout so any commits you pushed
+to the GPFS source tree are picked up immediately. **A plain
+`pip install vllm` would fail** — PyPI only ships the CPU-only wheel,
+so `import vllm` would later raise
+`ModuleNotFoundError: No module named 'vllm._C_stable_libtorch'`.
+
+Then it invokes `examples/eval-moe/moe_expert_stats.py` with the
+configured argv.
 
 ### 3. Monitor
 
@@ -303,6 +321,8 @@ rm -rf "${SCRATCH_BASE}/venv"
 
 ## Troubleshooting
 
+<!-- markdownlint-disable MD060 -->
+
 | Symptom                                                                                                                           | Likely cause                                                                                                                  | Fix                                                                                                                                                                                                                                                                                                               |
 | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `module: command not found`                                                                                                       | Lmod not in `.bashrc` on the GPU node                                                                                         | `source /usr/local/lmod/lmod/init/bash` before `module` calls, or trust the .sbatch's `module purge`                                                                                                                                                                                                              |
@@ -314,7 +334,7 @@ rm -rf "${SCRATCH_BASE}/venv"
 | `ggml_cuda_init: no CUDA devices found`                                                                                           | `CUDA_VISIBLE_DEVICES` empty or wrong GPU count                                                                               | Check `squeue -j $JOBID -o "%Gres"`; request `--gres=gpu:N` to match                                                                                                                                                                                                                                              |
 | `[fatal] datasets not staged on scratch` warning at job start                                                                     | Login-node `download-datasets.sh` wasn't run (or didn't finish)                                                               | Run on the login node first: `bash spartan/download-datasets.sh --datasets <names>`. The .sbatch will still proceed; the analyzer will fail mid-run.                                                                                                                                                              |
 | `ModuleNotFoundError: No module named 'datasets'` mid-run                                                                         | GPU node can't reach pypi + `download-datasets.sh` wasn't run                                                                 | Run on the login node first: `bash spartan/download-datasets.sh`                                                                                                                                                                                                                                                  |
-| `ModuleNotFoundError: No module named 'vllm'`                                                                                     | venv install failed; .sbatch's pip retry gave up                                                                              | Re-submit; if it keeps failing, install manually after the job has allocated: `source <SCRATCH>/venv/bin/activate && pip install vllm numpy datasets`                                                                                                                                                             |
+| `ModuleNotFoundError: No module named 'vllm'`                                                                                     | venv install failed; .sbatch's `uv pip install` retry gave up                                                                 | Re-submit; if it keeps failing, see the install command in the `.sbatch` header and run it manually.                                                                                                                                                                                                              |
 | `ConnectionError` from `datasets.load_dataset`                                                                                    | GPU node can't reach HF hub                                                                                                   | Same fix: pre-stage via login-node `download-datasets.sh` (the script auto-installs `datasets` and downloads the splits to scratch). Note that the **model weights** still need network access on the GPU node; if the GPU node has full outbound firewall on pypi+huggingface then the analyzer can't run there. |
 | `ConnectionError` from `LLM(model=...)` weight download                                                                           | GPU node can't reach HF hub, AND `download-models.sh` wasn't run                                                              | Run on the login node first: `bash spartan/download-models.sh --models <id>`. The .sbatch reads from `${HF_CACHE}`, which is where `download-models.sh` writes.                                                                                                                                                   |
 | OOM / `Killed` in job log                                                                                                         | 120B model + activations exceed `--mem`                                                                                       | Raise `--mem` (A100 node has 495 GB total) or use a smaller model/quant                                                                                                                                                                                                                                           |

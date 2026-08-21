@@ -237,10 +237,9 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export HF_HOME="${HF_CACHE}"
 export HUGGINGFACE_HUB_CACHE="${HF_CACHE}"
 
-# vLLM CUDA runtime knobs. ENABLE_UNIFIED_MEMORY=1 lets vLLM oversubscribe
-# GPU memory when it underestimates peak usage - safe on A100-80GB because
-# the OS will spill cleanly to host RAM.
-export VLLM_USE_V1="${VLLM_USE_V1:-1}"
+# (NB: no `VLLM_USE_V1` here - that env var was removed in vLLM 0.7+,
+# and newer versions log a WARNING + may misbehave if it's set. The
+# V1 engine is the only engine in current vLLM.)
 
 # ---------------------------------------------------------------- preflight
 # 1. Make sure the repo is in place.
@@ -316,46 +315,44 @@ if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
 fi
 # Always re-export PATH so the rest of the script picks up the venv's
 # python (which has vllm installed). pip / python go through this venv.
-export PATH="${VENV_DIR}/bin:${PATH}"
+# We also pull `uv` (the Astral pip replacement vLLM uses for its own
+# install instructions - see AGENTS.md §"Installing dependencies")
+# onto PATH if it's missing.
+export PATH="${VENV_DIR}/bin:${HOME}/.local/bin:${PATH}"
+if ! command -v uv >/dev/null 2>&1; then
+    echo "[info] uv not on PATH; installing to ~/.local ..."
+    err="$(mktemp)"
+    if ! curl -LsSf https://astral.sh/uv/install.sh | sh 2>"${err}"; then
+        echo "[fatal] uv install failed:" >&2
+        sed 's/^/  /' "${err}" >&2
+        rm -f "${err}"
+        exit 4
+    fi
+    rm -f "${err}"
+    export PATH="${HOME}/.local/bin:${PATH}"
+fi
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 
-# Make sure the analyzer's hard dependencies are present. `vllm` itself
-# is heavy (~5 GB of CUDA wheels) so we install it once per venv. `numpy`
-# and `datasets` are small.
-PY_DEPS=(vllm numpy datasets)
-py_dep_status=()
-for pkg in "${PY_DEPS[@]}"; do
-    if python3 -c "import ${pkg}" >/dev/null 2>&1; then
-        py_dep_status+=("${pkg}=ok")
-    else
-        py_dep_status+=("${pkg}=MISSING")
-    fi
-done
-echo "[info] python deps: ${py_dep_status[*]}"
-if printf '%s\n' "${py_dep_status[@]}" | grep -q MISSING; then
-    echo "[info] installing missing deps into venv ..."
-    err="$(mktemp)"
-    if ! python3 -m pip install --quiet "${PY_DEPS[@]}" 2>"${err}"; then
-        if grep -q "externally-managed-environment\|break-system-packages" "${err}"; then
-            echo "[info] PEP 668 in play; retrying with --break-system-packages ..."
-            if ! python3 -m pip install --quiet --break-system-packages \
-                    "${PY_DEPS[@]}" 2>"${err}"; then
-                echo "[fatal] pip install failed:" >&2
-                sed 's/^/  /' "${err}" >&2
-                rm -f "${err}"
-                exit 4
-            fi
-        else
-            echo "[fatal] pip install failed:" >&2
-            sed 's/^/  /' "${err}" >&2
-            rm -f "${err}"
-            exit 4
-        fi
-    fi
-    rm -f "${err}"
-    echo "[info] deps installed"
+# Make sure the analyzer's hard dependencies are present. The CRITICAL
+# one is vLLM: we install it editable from $REPO_ROOT with
+# VLLM_USE_PRECOMPILED=1 so the prebuilt CUDA wheels land in the venv
+# (a plain `pip install vllm` would pull the CPU-only PyPI wheel and
+# fail at import with `No module named 'vllm._C_stable_libtorch'`).
+# `numpy` and `datasets` are pure-Python and are added to the same
+# `uv pip install` so they're all version-aligned in the lockfile.
+echo "[info] installing vllm + numpy + datasets from $REPO_ROOT (editable) ..."
+if ! VLLM_USE_PRECOMPILED=1 uv pip install \
+        --python "${VENV_DIR}/bin/python" \
+        "numpy" \
+        "datasets" \
+        -e "${REPO_ROOT}" \
+        --torch-backend=auto 2>"${VENV_DIR}/install.err"; then
+    echo "[fatal] uv pip install failed:" >&2
+    sed 's/^/  /' "${VENV_DIR}/install.err" >&2
+    exit 4
 fi
+echo "[info] deps installed"
 
 # Final venv sanity check.
 if ! python3 -c "import vllm, numpy, datasets; print(f'vllm={vllm.__version__} numpy={numpy.__version__} datasets={datasets.__version__}')" 2>/dev/null; then
