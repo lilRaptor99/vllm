@@ -99,7 +99,8 @@
 #                                                  Cells are evaluated as MODELS x QUANTS.
 #   QUANTS_OVERRIDE space-separated vLLM quant tags (default: unset = no quant)
 #                                                  Forwarded as --quant <m1> <m2> ... to the analyzer.
-#   BENCHMARKS      space-separated subset of {mmlu,bbh,humaneval}
+#   BENCHMARKS      space-separated subset of {mmlu,bbh,humaneval,popqa,include}
+#                                                  (default: mmlu bbh humaneval)
 #                                                  (default: all three)
 #   NUM_SAMPLES     prompts per benchmark         (default: 256)
 #   MAX_TOKENS      generation length             (default: 256)
@@ -110,16 +111,29 @@
 #   SEED            sampler + sampling seed       (default: 0)
 #   HF_TOKEN        optional, for gated repos     (default: unset)
 #   SKIP_DATASET_CHECK  1 = skip the dataset preflight warning
-#                                                  (default: 0)
+#   SKIP_PYTHON_PLOTS  master switch for all Python post-processing:
+#                        aggregate_overview.py + jaccard_sweep_from_cpp.py
+#                        + cross_quant_jaccard_sweep_from_cpp.py.
+#                        1 = skip all (default - 4-day HPC budget usually
+#                            just wants the JSON; visualisations are
+#                            post-hoc on the login node).
+#                        0 = run all three.
+#                        The Python scripts live in the sister
+#                        llama-cpp-eval repo
+#                        (REPO_ROOT=/data/projects/uom00014/llama-cpp-eval,
+#                        examples/eval-moe-overview/); the sbatch calls
+#                        them directly via absolute path so the same
+#                        toolchain can consume both vLLM and llama.cpp
+#                        outputs uniformly.
 
 # ---------------------------------------------------------------- SLURM
 # IMPORTANT: `#SBATCH --gres=gpu:N` cannot use a shell variable, so
 # edit the value below AND keep NGPUS in sync (the body uses NGPUS
 # to auto-derive the tensor split, etc.). Default 1 = single GPU.
 #SBATCH --job-name=vllm-moe-eval
-#SBATCH --partition=gpu-a100-short
+#SBATCH --partition=gpu-a100
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=120G
 #SBATCH --time=0-03:55:00
 #SBATCH --output=spartan/logs/vllm-moe-eval-%j.out
@@ -196,10 +210,16 @@ BENCHMARKS="${BENCHMARKS:-mmlu bbh humaneval}"
 NUM_SAMPLES="${NUM_SAMPLES:-256}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
+N_SHOTS="${N_SHOTS:-5}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-${RESULTS_DIR}}"
 SEED="${SEED:-0}"
+# Master switch for all post-processing. 1 = skip (default; the GPU
+# budget usually just wants the JSON). 0 = run all three. See the
+# `SKIP_PYTHON_PLOTS` block in the env-var table at the top of this
+# file for the full rationale.
+SKIP_PYTHON_PLOTS="${SKIP_PYTHON_PLOTS:-1}"
 
 # ---------------------------------------------------------------- banner
 echo "============================================================"
@@ -221,6 +241,7 @@ echo "[$(date -Iseconds)] GPU_MEM_UTIL  = ${GPU_MEM_UTIL}"
 echo "[$(date -Iseconds)] ENFORCE_EAGER = ${ENFORCE_EAGER:-<unset>}"
 echo "[$(date -Iseconds)] OUTPUT_DIR    = ${OUTPUT_DIR}"
 echo "[$(date -Iseconds)] SEED          = ${SEED}"
+echo "[$(date -Iseconds)] SKIP_PYTHON_PLOTS = ${SKIP_PYTHON_PLOTS}"
 echo "[$(date -Iseconds)] CUDA_MODULE   = ${CUDA_MODULE}"
 echo "[$(date -Iseconds)] PYTHON_MODULE = ${PYTHON_MODULE}"
 echo "[$(date -Iseconds)] GCC_MODULE    = ${GCC_MODULE}"
@@ -613,23 +634,65 @@ else
 fi
 
 # Make sure the analyzer's hard dependencies are present. The CRITICAL
-# one is vLLM: we install it editable from $REPO_ROOT with
-# VLLM_USE_PRECOMPILED=1 so the prebuilt CUDA wheels land in the venv
-# (a plain `pip install vllm` would pull the CPU-only PyPI wheel and
-# fail at import with `No module named 'vllm._C_stable_libtorch'`).
+# one is vLLM: we install it editable from $REPO_ROOT (VLLM_USE_PRECOMPILED
+# is set above). When VLLM_USE_PRECOMPILED=1, the prebuilt CUDA wheel
+# lands in the venv (fast). When 0, uv builds vLLM from source against
+# the system CUDA toolkit - slower but links the same libcudart.so
+# the module-loaded CUDA ships, which avoids cu130-vs-driver-12.8
+# mismatches on hosts whose driver predates CUDA 13.
 # `numpy` and `datasets` are pure-Python and are added to the same
 # `uv pip install` so they're all version-aligned in the lockfile.
+# `datasets==4.5.0` is a hard pin: the login-node pre-download in
+# `spartan/download-datasets.sh` writes each split with the system
+# Python 3.9's `datasets 4.5.0`. The GPU venv's unconstrained
+# resolver pulled a mislabeled "1.1.1" package that is actually a
+# newer tree - the result is `Dataset.load_from_disk` on the GPU
+# node raises `KeyError: '_indexes'` because the writer's state
+# dict and the reader's expected fields drifted apart. Pinning to
+# the exact same version on both ends eliminates the drift.
+#
+# Note on the `pa.PyExtensionType` failure mode: it was caused by
+# the mislabeled venv datasets, not by an actual incompatibility
+# between modern `datasets` and modern `pyarrow`. Real
+# `datasets 4.5.0` ships `pyarrow>=21.0.0` and uses APIs that are
+# still present, so no `pyarrow<` pin is needed. (We previously
+# shipped a `pyarrow<18` pin here to work around the mislabeled
+# venv, but that conflicted with `datasets 4.5.0`'s own
+# `pyarrow>=21.0.0` requirement.)
 echo "[info] installing vllm + numpy + datasets from $REPO_ROOT (editable) ..."
 # --torch-backend=${TORCH_BACKEND} pulls torch/torchvision/torchaudio
-# from pytorch.org's CUDA-X.Y index (matches the module-loaded CUDA).
+# from pytorch.org's CUDA-X.Y index. For source build + driver CUDA
+# 12.8, cu129 is the right choice (cu128 caps at torch 2.11.0; cu130
+# requires driver >= 13.0).
 # --torch-backend=auto would look at the existing torch on PATH and
 # pick that - which on a fresh venv is the CPU-only PyPI wheel,
 # leading to a CPU-only vllm install and the well-known
 # `No module named 'vllm._C_stable_libtorch'` import error.
-if ! VLLM_USE_PRECOMPILED=1 uv pip install \
+# VLLM_USE_PRECOMPILED controls whether we install the precompiled
+# CUDA wheel from $REPO_ROOT (VLLM_USE_PRECOMPILED=1, fast) or compile
+# vLLM from source (VLLM_USE_PRECOMPILED=0, slower but links against
+# the system CUDA toolkit).
+#
+# Default here is 0 (source build). Reason: the precompiled wheel
+# shipped with this branch is built against CUDA 13, which forces
+# the venv to install cu130 nvidia runtime libs; the cu130 torch
+# wheel in turn requires driver CUDA >= 13.0 at runtime. Spartan
+# A100 nodes run driver CUDA 12.8, so the precompiled path fails
+# at engine init with "The NVIDIA driver on your system is too
+# old (found version 12080)". A source build compiles
+# _C_stable_libtorch.so against the module-loaded CUDA/12.4.1
+# toolkit, linking libcudart.so.12 instead - which the cu129
+# nvidia wheel already provides, and which works on driver 12.8.
+#
+# Override to 1 if you're on a host with driver CUDA >= 13.0
+# (or if your vllm branch ships a precompiled wheel whose CUDA
+# major matches a TORCH_BACKEND that your driver satisfies).
+VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-0}"
+echo "[info] VLLM_USE_PRECOMPILED=${VLLM_USE_PRECOMPILED} (TORCH_BACKEND=${TORCH_BACKEND})"
+if ! VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" uv pip install \
         --python "${VENV_DIR}/bin/python" \
         "numpy" \
-        "datasets" \
+        "datasets==4.5.0" \
         -e "${REPO_ROOT}" \
         --torch-backend="${TORCH_BACKEND}" 2>"${VENV_DIR}/install.err"; then
     echo "[fatal] uv pip install failed:" >&2
@@ -640,13 +703,14 @@ echo "[info] deps installed"
 
 # Bundle-path setup for CUDA shared libs. The PyTorch CUDA wheels
 # install a tree of `nvidia/<pkg>/lib/` directories inside the venv's
-# site-packages -- for cu129 that's `nvidia/cu13/lib/libcudart.so.13`
-# (CUDA 13 runtime), `nvidia/cu13/lib/libnvrtc.so.13`, and various
+# site-packages -- for cu129 that's `nvidia/cuda_runtime/lib/libcudart.so.12`
+# (CUDA 12 runtime), `nvidia/cuda_nvrtc/lib/libnvrtc.so.12`, and the
 # cu12 helper libs (cublas, cufft, curand, cusparse, etc.). The
 # dynamic linker doesn't search those paths by default, and vLLM's
-# `_C_stable_libtorch.so` links `libcudart.so.13` directly -- so
-# without this, the first `import vllm` raises
-# `ImportError: libcudart.so.13: cannot open shared object file`.
+# _C_stable_libtorch.so (whether precompiled against CUDA 13 or built
+# from source against the system CUDA/12.4.1 toolkit) links
+# libcudart directly -- so without this, the first `import vllm` raises
+# `ImportError: libcudart.so.<N>: cannot open shared object file`.
 #
 # We walk the venv's site-packages, collect every `nvidia/*/lib`
 # directory that actually exists, and prepend them to LD_LIBRARY_PATH.
@@ -671,9 +735,26 @@ if [[ -n "${_venv_lib_root}" && -d "${_venv_lib_root}" ]]; then
 fi
 if [[ -n "${_nvidia_lib_paths}" ]]; then
     export LD_LIBRARY_PATH="${_nvidia_lib_paths}:${LD_LIBRARY_PATH:-}"
-    echo "[info] LD_LIBRARY_PATH prepended with $(echo "${_nvidia_lib_paths}" | tr ':' '\n' | wc -l) nvidia lib dirs (e.g. libcudart.so.13, libnvrtc.so.13, libcublas.so.12)"
+    _lib_example="$(ls ${_nvidia_lib_paths//:/ } 2>/dev/null | grep -E '^lib(cudart|nvrtc|cublas)' | sort -u | head -3 | tr '\n' ',' | sed 's/,$//')"
+    echo "[info] LD_LIBRARY_PATH prepended with $(echo "${_nvidia_lib_paths}" | tr ':' '\n' | wc -l) nvidia lib dirs (e.g. ${_lib_example:-libcudart,libnvrtc,libcublas})"
+    unset _lib_example
+
+    # Symlink shim: vLLM's deep_gemm / fused_moe sub-modules are built
+    # against CUDA 13 and call `dlopen("libcudart.so.13")` directly. The
+    # cu129 torch wheel only ships `libcudart.so.12`. We materialise a
+    # `libcudart.so.13 -> libcudart.so.12` symlink in the first nvidia
+    # lib dir so the dlopen resolves. Safe because the two ABIs are
+    # binary-compatible (vLLM only calls a small subset of cudart
+    # entry points; none of them changed between CUDA 12 and 13 for
+    # what vLLM uses).
+    _cudart12="$(find "${_venv_lib_root}" -name 'libcudart.so.12' 2>/dev/null | head -1)"
+    if [[ -n "${_cudart12}" ]] && [[ ! -e "${_cudart12%.12}.13" ]]; then
+        ln -s "libcudart.so.12" "${_cudart12%.12}.13" && \
+            echo "[info] created shim: $(basename "${_cudart12%.12}.13") -> libcudart.so.12 (CUDA 13 dlopen shim)"
+    fi
+    unset _cudart12
 else
-    echo "[warn] no nvidia/*/lib dirs found under ${_venv_lib_root}; libcudart.so.13 may be missing at import time"
+    echo "[warn] no nvidia/*/lib dirs found under ${_venv_lib_root}; libcudart.so.<N> may be missing at import time"
 fi
 unset _nvidia_lib_paths _venv_lib_root _nvidia_lib
 
@@ -690,7 +771,7 @@ if ! "${VENV_DIR}/bin/python" -c \
     echo "[fatal] import output:" >&2
     sed 's/^/  /' "${VENV_DIR}/sanity.out" >&2
     echo "[fatal] common causes:" >&2
-    echo "[fatal]   - ${TORCH_BACKEND} wheel links a CUDA runtime (e.g. libcudart.so.13) that isn't on LD_LIBRARY_PATH. The fix above should have prepended the venv's nvidia/*/lib paths; if not, check that the cu${TORCH_BACKEND#cu}/lib subdir exists under the venv's site-packages." >&2
+    echo "[fatal]   - ${TORCH_BACKEND} wheel links a CUDA runtime (e.g. libcudart.so.12 for cu12X, libcudart.so.13 for cu130) that isn't on LD_LIBRARY_PATH. The fix above should have prepended the venv's nvidia/*/lib paths; if not, check that the right cu<X>/lib subdir exists under the venv's site-packages." >&2
     echo "[fatal]   - the editable install landed in a different Python than ${VENV_DIR}/bin/python; verify with: ls -la ${VENV_DIR}/bin/python*" >&2
     echo "[fatal]   - the module-loaded EasyBuild Python (${PYTHON_MODULE}) is shadowing the venv; explicitly call \${VENV_DIR}/bin/python instead of bare python3." >&2
     exit 4
@@ -707,6 +788,7 @@ RUN_ARGS=(
     --benchmarks ${BENCHMARKS}
     --num-samples "${NUM_SAMPLES}"
     --max-tokens "${MAX_TOKENS}"
+    --n-shots "${N_SHOTS}"
     --max-model-len "${MAX_MODEL_LEN}"
     --gpu-memory-utilization "${GPU_MEM_UTIL}"
     --output-dir "${OUTPUT_DIR}"
@@ -733,6 +815,116 @@ cd "${REPO_ROOT}"
 # install AND doesn't have libcudart.so.13 on its loader path. Using
 # the absolute path makes the analyzer invocation independent of PATH.
 "${VENV_DIR}/bin/python" examples/eval-moe/moe_expert_stats.py "${RUN_ARGS[@]}"
+
+# ---------------------------------------------------------------- post-processing
+# Mirrors the llama-cpp-eval's `llama-moe-eval.sbatch` post-processing
+# block. By default (SKIP_PYTHON_PLOTS=1) we just emit the JSON and
+# move on - the visualisations + Jaccard sweeps are post-hoc on the
+# login node (the `pip install --user numpy matplotlib` is also done
+# by the .sbatch preflight so the Python scripts have what they need).
+#
+# Setting SKIP_PYTHON_PLOTS=0 re-runs:
+#   1. aggregate_overview.py         (writes per-cell overview heatmaps)
+#   2. cross_quant_jaccard_sweep_from_cpp.py  (cross-quant top-K alignment)
+#   3. jaccard_sweep_from_cpp.py     (cross-dataset Jaccard K-sweep)
+#
+# All three live in the sister llama-cpp-eval repo; we resolve the
+# path from the well-known project root. The scripts are
+# schema-agnostic - they read the same `expert_counts.json` shape
+# regardless of whether the JSON was written by the vLLM analyzer
+# or the llama.cpp C++ binary.
+if [[ "${SKIP_PYTHON_PLOTS}" -ne 1 ]]; then
+    # Make sure matplotlib is importable in the venv (numpy ships
+    # with vllm; matplotlib does not). We auto-install into the
+    # venv (rather than ~/.local) so the post-processing scripts
+    # pick up the venv's matplotlib, which has a matching
+    # libpython. Mirrors the llama-cpp-eval sbatch's preflight.
+    if ! "${VENV_DIR}/bin/python" -c "import matplotlib" >/dev/null 2>&1; then
+        echo "[info] matplotlib not importable; pip-installing into the venv ..."
+        if ! "${VENV_DIR}/bin/pip" install --quiet matplotlib; then
+            echo "[warn] matplotlib install failed; the post-processing scripts will error out"
+        fi
+    fi
+
+    LLAMACPP_EVAL="/data/projects/uom00014/llama-cpp-eval"
+    OVERVIEW_DIR="${LLAMACPP_EVAL}/examples/eval-moe-overview"
+
+    if [[ ! -d "${LLAMACPP_EVAL}" ]]; then
+        echo "[warn] sister llama-cpp-eval repo not at ${LLAMACPP_EVAL}; skipping post-processing"
+    else
+        echo "============================================================"
+        echo "[$(date -Iseconds)] post-processing: aggregate_overview.py"
+        echo "============================================================"
+        if ! "${VENV_DIR}/bin/python" "${OVERVIEW_DIR}/aggregate_overview.py" \
+                --results-dir "${OUTPUT_DIR}"; then
+            echo "[warn] aggregate_overview.py failed; see logs"
+        fi
+
+        # Cross-dataset Jaccard sweep per (model, quant) cell.
+        echo "============================================================"
+        echo "[$(date -Iseconds)] post-processing: jaccard_sweep_from_cpp.py"
+        echo "============================================================"
+        n_cells=0
+        # Glob every (model_safe, quant_safe) cell that has at least one
+        # moe-*/expert_counts.json inside. Mirrors the discovery loop
+        # in the llama-cpp-eval sbatch.
+        for cell_dir in "${OUTPUT_DIR}"/*/*/; do
+            [[ -d "${cell_dir}" ]] || continue
+            compgen -G "${cell_dir}moe-*/expert_counts.json" >/dev/null \
+                || continue
+            safe="$(basename "$(dirname "${cell_dir}")")"
+            quant="$(basename "${cell_dir}")"
+            # Reverse model_safe (replace FIRST -- with /) to recover
+            # the HF repo id.
+            if [[ "${safe}" == *"--"* ]]; then
+                model_id="${safe/--//}"
+            else
+                model_id="${safe}"
+            fi
+            log="${cell_dir%/}/jaccard_sweep.log"
+            n_cells=$(( n_cells + 1 ))
+            echo "[info] jaccard cell=${cell_dir}  model=${model_id}  quant=${quant}"
+            if ! "${VENV_DIR}/bin/python" "${OVERVIEW_DIR}/jaccard_sweep_from_cpp.py" \
+                    --cell-dir "${cell_dir%/}" \
+                    --model-id "${model_id}" \
+                    --quant "${quant}" \
+                    >"${log}" 2>&1; then
+                echo "[warn] jaccard sweep failed for ${cell_dir}; log: ${log}"
+            else
+                echo "[ok]   jaccard sweep -> ${cell_dir%/}/jaccard_sweep/"
+            fi
+        done
+        echo "[info] jaccard sweep: ${n_cells} cell(s) processed"
+
+        # Cross-quant Jaccard sweep per model.
+        echo "============================================================"
+        echo "[$(date -Iseconds)] post-processing: cross_quant_jaccard_sweep_from_cpp.py"
+        echo "============================================================"
+        for model_dir in "${OUTPUT_DIR}"/*/; do
+            [[ -d "${model_dir}" ]] || continue
+            safe="$(basename "${model_dir%/}")"
+            # Only run if at least one (quant_safe, moe-*, expert_counts.json)
+            # combination exists under the model dir.
+            compgen -G "${model_dir}*/moe-*/expert_counts.json" >/dev/null \
+                || continue
+            if [[ "${safe}" == *"--"* ]]; then
+                model_id="${safe/--//}"
+            else
+                model_id="${safe}"
+            fi
+            log="${model_dir%/}/cross_quant.log"
+            echo "[info] cross-quant model=${model_id}  dir=${model_dir%/}"
+            if ! "${VENV_DIR}/bin/python" "${OVERVIEW_DIR}/cross_quant_jaccard_sweep_from_cpp.py" \
+                    --model-dir "${model_dir%/}" \
+                    --model-id "${model_id}" \
+                    >"${log}" 2>&1; then
+                echo "[warn] cross-quant sweep failed for ${model_dir}; log: ${log}"
+            else
+                echo "[ok]   cross-quant sweep -> ${model_dir%/}/cross_quant_jaccard_sweep/"
+            fi
+        done
+    fi
+fi
 
 echo "============================================================"
 echo "[$(date -Iseconds)] vllm-moe-eval finished (rc=$?)"

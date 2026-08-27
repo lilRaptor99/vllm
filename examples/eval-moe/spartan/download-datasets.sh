@@ -1,36 +1,35 @@
 #!/usr/bin/env bash
 #
-# spartan/download-datasets.sh - login-node pre-download for the 3
+# spartan/download-datasets.sh - login-node pre-download for the 5
 # benchmarks consumed by `examples/eval-moe/moe_expert_stats.py`:
 #
 #   mmlu      (cais/mmlu,                  subset "all", test+dev splits)
 #   bbh       (Joschka/big_bench_hard,    all 27 sub-tasks, test split)
 #   humaneval (openai/openai_humaneval,    test split)
+#   popqa     (akariasai/PopQA,            test split - per-row jsonl)
+#   include   (CohereLabs/include-base-44, per-row jsonl across 44 languages)
 #
 # Why this exists: the GPU compute nodes on Spartan are firewalled off
 # from the public internet for outbound HTTPS, AND they don't ship the
-# `datasets` Python package. Both are required by `moe_expert_stats.py`'s
-# lazy `from datasets import load_dataset(...)` blocks. Pre-running the
-# downloads on the login node (which has internet + an easy
-# `pip install --user datasets`) means the GPU job starts with every
-# dataset already on disk and never tries to fetch one mid-eval.
+# `datasets` Python package. Pre-running the downloads on the login
+# node (which has internet + `pip install --user datasets`) means the
+# GPU job starts with every dataset already on disk and never tries to
+# fetch one mid-eval.
 #
-# IMPORTANT: keep DEFAULT_DATASETS in sync with the `BENCHMARK_LOADERS`
-# dict at the top of `examples/eval-moe/moe_expert_stats.py`. They
-# intentionally duplicate rather than source because the analyzer defines
-# its own list at module scope; this script must also work standalone on
-# the login node where the analyzer may not have been imported yet.
+# IMPORTANT: keep DEFAULT_DATASETS in sync with `BENCHMARK_LOADERS`
+# in `examples/eval-moe/moe_expert_stats.py`. They intentionally
+# duplicate rather than source because the analyzer defines its own
+# list at module scope; this script must also work standalone on the
+# login node where the analyzer may not have been imported yet.
 #
 # Behaviour:
 #   - Resolves SCRATCH_BASE the same way the .sbatch does.
 #   - Auto-installs `datasets` to ~/.local if missing (login node only).
-#   - For each dataset, calls `datasets.load_dataset(...)` and writes the
-#     splits to `${SCRATCH_BASE}/datasets/<name>/` as HuggingFace's
-#     native Arrow-on-disk format (one directory per split). The
-#     analyzer reads them via `datasets.load_dataset(<path>, split=...)`
-#     so the layout matches what HF Datasets expects.
-#   - Idempotent: re-running skips datasets whose directory already
-#     exists and contains the requested splits.
+#   - For each dataset, dispatches to its own downloader (mmlu/bbh/
+#     humaneval use a save_to_disk-based internal path; popqa/include
+#     shell out to dedicated `download-popqa.py` / `download-include.py`
+#     helpers under this directory).
+#   - Idempotent: re-running skips datasets whose output already exists.
 #   - Logs everything; the GPU job's benchmark loaders become no-ops
 #     once this script has populated the cache.
 
@@ -43,21 +42,34 @@ readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ------------------------------------------------------------- dataset list
 #
-# IMPORTANT: keep in sync with `BENCHMARK_LOADERS` in
-# examples/eval-moe/moe_expert_stats.py. The keys are the analyzer's
-# short names; the values are the (path, subset_or_none, splits) tuples
-# consumed by `download_one`.
+# Two layouts:
+#   * "save_to_disk" (mmlu, bbh, humaneval): each split is its own
+#     arrow directory under ${DATASET_DIR}/<ds>/<split>/. The
+#     `internal_save_to_disk` helper drives the load + save.
+#   * "jsonl" (popqa, include): one file per dataset
+#     (${DATASET_DIR}/<ds>/<ds>.jsonl) plus sidecar partition lists.
+#     The `dispatch_external_downloader` helper invokes the per-dataset
+#     Python downloader in this directory.
+readonly -A DATASET_LAYOUT=(
+    [mmlu]="save_to_disk"
+    [bbh]="save_to_disk"
+    [humaneval]="save_to_disk"
+    [popqa]="jsonl"
+    [include]="jsonl"
+)
+# HuggingFace ids (used by the save_to_disk path only).
 readonly -A DATASET_HF_ID=(
     [mmlu]="cais/mmlu"
     [bbh]="Joschka/big_bench_hard"
     [humaneval]="openai/openai_humaneval"
 )
+# Subset / config hint (passed to load_dataset for the save_to_disk path).
 readonly -A DATASET_SUBSET=(
     [mmlu]="all"
     [bbh]="__all__"          # special sentinel - download every sub-task
     [humaneval]=""
 )
-# Splits to stage. The analyzer reads:
+# Splits to stage under ${DATASET_DIR}/<ds>/<split>/. The analyzer reads:
 #   mmlu:      test + dev
 #   bbh:       test (across all 27 sub-tasks)
 #   humaneval: test
@@ -65,6 +77,24 @@ readonly -A DATASET_SPLITS=(
     [mmlu]="test dev"
     [bbh]="test"
     [humaneval]="test"
+)
+# Markers that prove the save_to_disk cache is fully populated for a
+# dataset. If every required file under out_dir is present, the download
+# is skipped on a re-run.
+readonly -A DATASET_DONE_MARKER=(
+    [mmlu]="test dev"   # both subdirs must exist
+    [bbh]="__all__"     # special: every sub-task subdir must have test/
+    [humaneval]="test"
+)
+# Per-dataset downloader (only for jsonl layout).
+readonly -A JSONL_DOWNLOADER=(
+    [popqa]="${SCRIPT_DIR}/download-popqa.py"
+    [include]="${SCRIPT_DIR}/download-include.py"
+)
+# Per-dataset done marker for jsonl layout.
+readonly -A JSONL_DONE_MARKER=(
+    [popqa]="popqa.jsonl"
+    [include]="include.jsonl"
 )
 
 # ----------------------------------------------------------- path resolution
@@ -125,12 +155,12 @@ ensure_datasets() {
     export PATH="${HOME}/.local/bin:${PATH}"
 }
 
-# ---------------------------------------------------------- download helper
+# ---------------------------------------------------------- download helpers
 #
-# Downloads one (short_name, hf_id, subset, splits) entry. Writes to
+# save_to_disk path: download a (hf_id, subset, splits) entry to
 # ${out_dir}/. Re-runs are no-ops when the directory exists and
 # contains every requested split.
-download_one() {
+download_save_to_disk() {
     local short_name="$1"
     local hf_id="${DATASET_HF_ID[${short_name}]}"
     local subset="${DATASET_SUBSET[${short_name}]}"
@@ -159,9 +189,15 @@ download_one() {
     fi
 
     echo "[info] ${short_name}: downloading ${hf_id} -> ${out_dir} ..."
-    local subset_flag=""
+    # subset_args and split_args are passed via array expansion so each
+    # flag + its value become a separate argv element. The previous
+    # "subset_flag=\"--subset ${subset}\"" string form put the whole
+    # "--subset all" into a single argv element, which the parser
+    # below then silently skipped (it only matches on the exact flag
+    # name). Pass as separate tokens instead.
+    local subset_args=()
     if [[ -n "${subset}" && "${subset}" != "__all__" ]]; then
-        subset_flag="--subset ${subset}"
+        subset_args=(--subset "${subset}")
     fi
 
     # Special-case BBH: enumerate the 27 sub-task configs and download
@@ -174,17 +210,30 @@ download_one() {
         return $?
     fi
 
-    local split_args=""
+    local split_args=()
     for split in ${splits}; do
-        split_args+="--split ${split} "
+        split_args+=(--split "${split}")
     done
 
-    if ! python3 - "${hf_id}" "${out_dir}" "${subset_flag}" ${split_args} >>"${log}" 2>&1 <<'PY'
+    if ! python3 - "${hf_id}" "${out_dir}" "${subset_args[@]}" "${split_args[@]}" >>"${log}" 2>&1 <<'PY'
 import sys
 from datasets import load_dataset
 
 (hf_id, out_dir) = sys.argv[1], sys.argv[2]
 extra = sys.argv[3:]
+
+# `datasets >= 3` renamed the `name=` kwarg to `config_name=`. The old
+# `name=` is silently dropped, which then produces the misleading
+# "Config name is missing" error. Probe for whichever kwarg the
+# installed `datasets` understands and use that.
+import inspect
+try:
+    _sig = inspect.signature(load_dataset)
+except (TypeError, ValueError):
+    _sig = None
+_subset_kwarg = "config_name"
+if _sig is not None and "config_name" not in _sig.parameters and "name" in _sig.parameters:
+    _subset_kwarg = "name"
 
 kwargs = {}
 splits = []
@@ -196,7 +245,7 @@ i = 0
 while i < len(extra):
     flag = extra[i]
     if flag == "--subset" and i + 1 < len(extra) and not extra[i + 1].startswith("--"):
-        kwargs["name"] = extra[i + 1]
+        kwargs[_subset_kwarg] = extra[i + 1]
         i += 2
     elif flag == "--split" and i + 1 < len(extra) and not extra[i + 1].startswith("--"):
         splits.append(extra[i + 1])
@@ -211,10 +260,10 @@ while i < len(extra):
 if not splits:
     sys.exit("no `--split` arguments reached the python helper; check the shell quoting in download_one()")
 
-# `name` (subset) is fixed across splits; load each split independently
-# so we get one directory per split under out_dir.
+# `name`/`config_name` (subset) is fixed across splits; load each split
+# independently so we get one directory per split under out_dir.
 for split in splits:
-    print(f"  - downloading split={split!r} ...")
+    print(f"  - downloading split={split!r} (subset={kwargs.get(_subset_kwarg)!r}) ...")
     ds = load_dataset(hf_id, split=split, **kwargs)
     ds.save_to_disk(f"{out_dir}/{split}")
     print(f"  - saved {split} ({len(ds)} rows) to {out_dir}/{split}")
@@ -245,6 +294,12 @@ out_dir = sys.argv[2]
 
 configs = get_dataset_config_names(hf_id)
 print(f"  - {len(configs)} sub-tasks: {configs}")
+# `Joschka/big_bench_hard` exposes `few_shot_prompts` as a config
+# alongside the 27 real tasks. It's a meta-config of in-context
+# examples, not a scoring task, and would dilute the routing signal
+# if we included it. Filter it out before downloading.
+configs = [c for c in configs if c != "few_shot_prompts"]
+print(f"  - {len(configs)} real sub-tasks after filter: {configs}")
 for cfg in configs:
     cfg_dir = f"{out_dir}/{cfg}"
     split_dir = f"{cfg_dir}/test"
@@ -256,15 +311,69 @@ for cfg in configs:
     # kept re-downloading on every run.
     if (
         os.path.isfile(os.path.join(split_dir, "dataset_info.json"))
-        and os.path.isdir(os.path.join(split_dir, "data"))
+        and (
+            any(
+                n.startswith("data-") and n.endswith(".arrow")
+                for n in os.listdir(split_dir)
+            )
+            or any(
+                n.startswith("data-") and n.endswith(".arrow")
+                for n in os.listdir(os.path.join(split_dir, "data"))
+            )
+        )
     ):
         print(f"  - {cfg}: already cached, skip")
         continue
     print(f"  - {cfg}: downloading ...")
-    ds = load_dataset(hf_id, cfg, split="test")
+    # In `datasets >= 3`, the BBH sub-task name is exposed as the
+    # dataset's only split (not `test`). `load_dataset(hf, cfg,
+    # split="test")` raises "Unknown split" - use `split=cfg`.
+    ds = load_dataset(hf_id, cfg, split=cfg)
     ds.save_to_disk(split_dir)
     print(f"  - {cfg}: saved {len(ds)} rows to {split_dir}")
 PY
+}
+
+# jsonl path: shell out to the per-dataset Python downloader
+# (download-popqa.py, download-include.py). These mirror the
+# sister llama-cpp-eval/scripts so the two projects share the same
+# on-disk cache layout.
+download_jsonl() {
+    local short_name="$1"
+    local script="${JSONL_DOWNLOADER[${short_name}]}"
+    local out_dir="${DATASETS_DIR}/${short_name}"
+    local marker="${JSONL_DONE_MARKER[${short_name}]}"
+    local log="${out_dir}.download.log"
+
+    mkdir -p "${out_dir}"
+
+    if [[ -f "${out_dir}/${marker}" ]]; then
+        echo "[info] ${short_name}: already prepared (${marker}), skip"
+        return 0
+    fi
+
+    echo "[info] ${short_name}: downloading via ${script} -> ${out_dir} ..."
+    if ! python3 "${script}" --outdir "${out_dir}" >>"${log}" 2>&1; then
+        echo "[fatal] ${short_name} download failed; log: ${log}" >&2
+        return 1
+    fi
+    echo "[info] ${short_name}: ok"
+}
+
+download_one() {
+    local short_name="$1"
+    case "${DATASET_LAYOUT[${short_name}]:-}" in
+        save_to_disk)
+            download_save_to_disk "${short_name}"
+            ;;
+        jsonl)
+            download_jsonl "${short_name}"
+            ;;
+        *)
+            echo "[fatal] unknown layout for '${short_name}'" >&2
+            return 1
+            ;;
+    esac
 }
 
 # --------------------------------------------------------------- CLI parsing
@@ -274,8 +383,8 @@ print_usage() {
 Usage: bash spartan/download-datasets.sh [options]
 
 Options:
-  --datasets <ds> [<ds> ...]   subset of {mmlu, bbh, humaneval}
-                                (default: all three)
+  --datasets <ds> [<ds> ...]   subset of {mmlu, bbh, humaneval, popqa, include}
+                                (default: all five)
   --scratch-base <path>        override SCRATCH_BASE
                                 (default: ${SCRATCH}/vllm or
                                  /data/scratch/projects/uom00014/vllm)
@@ -284,7 +393,7 @@ Options:
   -h, --help                   show this message and exit
 
 Examples:
-  # Download everything (mmlu + bbh + humaneval):
+  # Download everything (mmlu + bbh + humaneval + popqa + include):
   bash spartan/download-datasets.sh
 
   # Just MMLU (fastest smoke test):
@@ -301,7 +410,7 @@ Environment:
 EOF
 }
 
-DATASETS=(mmlu bbh humaneval)
+DATASETS=(mmlu bbh humaneval popqa include)
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -329,7 +438,7 @@ parse_args() {
 }
 
 validate_choices() {
-    local -a ALL=(mmlu bbh humaneval)
+    local -a ALL=(mmlu bbh humaneval popqa include)
     local ds
     for ds in "${DATASETS[@]}"; do
         local known=0
@@ -367,9 +476,9 @@ main() {
     echo "============================================================"
 
     # Estimate disk usage up front so the user can abort if it's too big.
-    # Worst case (mmlu full ~250 MB + bbh ~30 MB + humaneval ~3 MB) is
-    # ~300 MB total - small enough that we don't bother asking for
-    # confirmation. Just print it.
+    # Worst case (mmlu ~250 MB + bbh ~30 MB + humaneval ~3 MB + popqa ~50 MB
+    # + include ~150 MB) is ~500 MB total - small enough that we don't
+    # bother asking for confirmation. Just print it.
     total_mb=0
     case "${DATASETS[*]}" in
         *mmlu*)      total_mb=$((total_mb + 250)) ;;
@@ -379,6 +488,12 @@ main() {
     esac
     case "${DATASETS[*]}" in
         *humaneval*) total_mb=$((total_mb + 3))   ;;
+    esac
+    case "${DATASETS[*]}" in
+        *popqa*)     total_mb=$((total_mb + 50))  ;;
+    esac
+    case "${DATASETS[*]}" in
+        *include*)   total_mb=$((total_mb + 150)) ;;
     esac
     echo "[info] estimated cache footprint: ~${total_mb} MB"
 

@@ -3,13 +3,51 @@
 """
 Per-layer expert activation statistics for MoE models.
 
-This script runs an MoE model on a set of benchmarks (MMLU, Big-Bench-Hard,
-HumanEval) and writes one JSON file per benchmark that records, for every
-layer of the model, how many tokens were routed to each expert.
+This script runs an MoE model on a configurable subset of benchmarks
+(MMLU, BBH, HumanEval, PopQA, INCLUDE) and writes one JSON file per
+benchmark that records, for every layer of the model, how many tokens
+were routed to each expert (the "marginal" counts) plus the per-layer
+and adjacent-layer co-activation pair counts (mirroring the schema
+emitted by the sister project's `llama-eval-moe-*` C++ binaries so the
+same downstream post-processing / Jaccard-sweep tools can consume
+both).
 
-The capture mechanism is vLLM's built-in `enable_return_routed_experts`,
-which streams the per-token, per-layer, per-topk expert-id array out of
-`CompletionOutput.routed_experts`. We only aggregate it here.
+The capture mechanism is vLLM's built-in
+`enable_return_routed_experts=True`, which streams the per-token,
+per-layer, per-topk expert-id array out of
+`CompletionOutput.routed_experts`. We aggregate it here into:
+  * per-row marginal [L, E] int64 count matrices (one record per
+    MMLU subject, BBH sub-task, HumanEval task, PopQA relation
+    type, or INCLUDE (language, domain) group)
+  * per-row [L, E, E] intra-layer and [L-1, E, E] adjacent-layer
+    co-activation pair counts
+  * per-benchmark [L, E] / [L, E, E] / [L-1, E, E] aggregate
+    (sum across rows) for `aggregate_overview.py` to consume
+
+The output schema is intentionally bit-compatible with the JSON
+files the sister `llama-cpp-eval/examples/eval-moe-*` C++ binaries
+write, so the same post-processing toolchain
+(`examples/eval-moe-overview/aggregate_overview.py`,
+`jaccard_sweep_from_cpp.py`, `cross_quant_jaccard_sweep_from_cpp.py`)
+can read vLLM-produced and llama.cpp-produced outputs uniformly.
+See the `examples/eval-moe/README.md` for the full schema doc.
+
+Per-row record keys follow the convention from
+`aggregate_overview._RECORD_KEYS`:
+  * MMLU  -> "subjects"   (key = MMLU subject name)
+  * BBH   -> "subjects"   (key = BBH sub-task name; `few_shot_prompts`
+                            filtered)
+  * HumanEval -> "tasks"  (key = "HumanEval/<task_id>")
+  * PopQA -> "props"     (key = PopQA relation type, e.g. "occupation")
+  * INCLUDE -> "by_langdom"  (key = "<language>::<domain>")
+
+Per-row token accounting:
+  * MMLU + BBH        -> "n_tokens" (one number; prefill + 5-shot +
+                                          test question tokens;
+                                          no autoregressive decode)
+  * HumanEval+PopQA+INCLUDE -> "n_tokens_prefill" + "n_tokens_generated"
+                                  (prefill only vs full autoregressive
+                                   decode; mirrors the C++ binaries)
 
 Usage:
     python examples/eval-moe/moe_expert_stats.py \\
@@ -17,7 +55,7 @@ Usage:
         --benchmarks mmlu bbh humaneval \\
         --num-samples 256 \\
         --max-tokens 256 \\
-        --output-dir ./expert_stats_olmoe
+        --output-dir /data/scratch/projects/uom00014/vllm/results
 
     # multiple models + a quantization method (e.g. AWQ on the same repo):
     python examples/eval-moe/moe_expert_stats.py \\
@@ -25,7 +63,7 @@ Usage:
                 LiteLLMs/Mixtral-8x22B-Instruct-v0.1 \\
         --quant awq \\
         --benchmarks mmlu bbh humaneval \\
-        --output-dir ./expert_stats
+        --output-dir /data/scratch/projects/uom00014/vllm/results
 """
 
 from __future__ import annotations
@@ -37,7 +75,7 @@ import logging
 import os
 import random
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
@@ -52,6 +90,17 @@ DEFAULT_BENCHMARKS = ("mmlu", "bbh", "humaneval")
 DEFAULT_NUM_SAMPLES = 256
 DEFAULT_MAX_TOKENS = 256
 
+# Default parent directory where `spartan/download-datasets.sh` writes
+# the pre-staged datasets. Layout:
+#   ${DATASET_DIR}/<ds_short>/<split>            (mmlu, bbh, humaneval - arrow save_to_disk)
+#   ${DATASET_DIR}/<ds_short>/<ds_short>.jsonl   (popqa, include - per-row jsonl)
+# The analyzer reads from this path when present and falls back to a
+# network load only when the cache is missing. Override via the
+# `DATASET_DIR` env var for non-Spartan hosts.
+DEFAULT_DATASET_DIR = os.environ.get(
+    "DATASET_DIR", "/data/scratch/projects/uom00014/vllm/datasets"
+)
+
 # MMLU letter choices shown to the model.
 MMLU_LETTERS = ("A", "B", "C", "D")
 
@@ -61,6 +110,51 @@ MMLU_5SHOT_TEMPLATE = (
 )
 MMLU_QUESTION_TEMPLATE = "{question}\nA. {a}\nB. {b}\nC. {c}\nD. {d}\nAnswer:"
 
+# Per-benchmark metadata. The keys here are the top-level JSON record
+# keys the `aggregate_overview._load_one` probe expects
+# (tuple order: tasks, subjects, props, by_langdom). The C++ side uses
+# the same key per dataset.
+BENCHMARK_RECORD_KEY: dict[str, str] = {
+    "mmlu": "subjects",
+    "bbh": "subjects",
+    "humaneval": "tasks",
+    "popqa": "props",
+    "include": "by_langdom",
+}
+# Per-benchmark `totals.<x>_run` key (the count of distinct records
+# under the record key, e.g. "subjects_run" for mmlu).
+BENCHMARK_RUN_KEY: dict[str, str] = {
+    "mmlu": "subjects_run",
+    "bbh": "subjects_run",
+    "humaneval": "tasks_run",
+    "popqa": "props_run",
+    "include": "langdoms_run",
+}
+# Per-benchmark `config.<x>` key (the per-row question budget).
+BENCHMARK_QUESTIONS_CONFIG_KEY: dict[str, str] = {
+    "mmlu": "questions_per_subject",
+    "bbh": "questions_per_subject",
+    "humaneval": "questions_per_task",
+    "popqa": "questions_per_prop",
+    "include": "questions_per_langdom",
+}
+# Per-benchmark prompt-format tag (for the `config.prompt_format` field).
+BENCHMARK_PROMPT_FORMAT: dict[str, str] = {
+    "mmlu": "few_shot_chat",
+    "bbh": "few_shot_chat",
+    "humaneval": "completion",
+    "popqa": "completion_constrained",
+    "include": "few_shot_inlang_5shot",
+}
+# Per-benchmark `few_shot_pool` config field (only set for benchmarks
+# that use a 5-shot format from a held-out split).
+BENCHMARK_FEWSHOT_POOL: dict[str, str] = {
+    "mmlu": "cais/mmlu dev split",
+    "bbh": "self",  # BBH exposes a `few_shot_prompts` meta-config on the HF Hub
+    "humaneval": "",
+    "popqa": "",
+    "include": "self",  # 5-shot from the same (lang, dom) group
+}
 
 # ---------------------------------------------------------------------------
 # Dataset loaders
@@ -68,12 +162,52 @@ MMLU_QUESTION_TEMPLATE = "{question}\nA. {a}\nB. {b}\nC. {c}\nD. {d}\nAnswer:"
 
 
 @dataclass
+class BenchmarkRow:
+    """One record under the benchmark's top-level record key.
+
+    Attributes:
+        key: The record key (MMLU subject, BBH sub-task, HumanEval task id,
+             PopQA relation type, or INCLUDE `<language>::<domain>`).
+             Must be unique within a benchmark.
+        prompts: One or more prompts belonging to this record. For most
+                 benchmarks it's a single prompt per record; can be multiple
+                 for batched workloads.
+        prefill_tokens: Total prefill token count across all prompts in the
+                        row (computed offline by the tokenizer, exact).
+        generated_tokens: Total generated token count across all prompts
+                          in the row (matches the model's `max_tokens` cap;
+                          the actual generated count comes back from
+                          `aggregate_expert_counts`).
+    """
+
+    key: str
+    prompts: list[str] = field(default_factory=list)
+    prefill_tokens: int = 0
+    generated_tokens: int = 0
+
+
+@dataclass
 class BenchmarkPrompts:
-    """A list of prompts loaded from a benchmark dataset."""
+    """A benchmark's per-row prompt grouping + meta.
+
+    Attributes:
+        name: Short benchmark name (e.g. "mmlu"). Used as the output
+              directory suffix (`moe-<name>/expert_counts.json`).
+        record_key: The top-level JSON key under which per-row records
+                     will be emitted ("subjects" / "tasks" / "props" /
+                     "by_langdom"). Derived from `BENCHMARK_RECORD_KEY`.
+        rows: One `BenchmarkRow` per record (subject / task / prop /
+              langdom).
+        arch_name: A short architecture hint for the model's MoE
+                   block (e.g. "olmoe", "mixtral", "gpt-oss"). Currently
+                   informational only; downstream tools that need a
+                   specific name can re-derive it from the HF config.
+    """
 
     name: str
-    prompts: list[str]
-    extra: dict[str, object]
+    record_key: str
+    rows: list[BenchmarkRow] = field(default_factory=list)
+    arch_name: str = "unknown"
 
 
 def _sample_indices(n: int, k: int, seed: int) -> list[int]:
@@ -84,19 +218,144 @@ def _sample_indices(n: int, k: int, seed: int) -> list[int]:
     return indices[:k]
 
 
-def load_mmlu_prompts(num_samples: int, seed: int) -> BenchmarkPrompts:
-    """Load `num_samples` random MMLU test prompts with a 5-shot prefix.
+def _try_local_or_remote(
+    local_dir: str,
+    hf_id: str,
+    subset: str | None,
+    split: str,
+) -> Any:
+    """Load a dataset split from the local cache, or fall back to HF Hub.
 
-    Returns the formatted prompt as a string ending in "Answer:". The model
-    answer letter (A/B/C/D) is not part of the prompt — we just want to
-    observe expert routing on the question text.
+    The Spartan login-node pre-download (`spartan/download-datasets.sh`)
+    writes each split to `${DATASET_DIR}/<ds>/<split>/` as a HuggingFace
+    `Dataset.save_to_disk()` arrow directory. When present,
+    `load_from_disk(...)` is preferred because (a) the GPU compute nodes
+    are firewalled off the public internet, so `load_dataset(...)` over
+    the network always fails, and (b) `load_dataset("cais/mmlu", "all",
+    ...)` on recent `datasets` versions also requires a matching
+    `cais/mmlu/mmlu.py` loading script on the HF Hub, which is a
+    separate download and can also fail behind the firewall. Reading the
+    pre-staged arrow files is version-stable across `datasets` releases
+    and needs no network.
+
+    `subset` is the multi-config name (e.g. ``"all"`` for MMLU, a
+    sub-task for BBH). It's not consumed by `load_from_disk` (the
+    subset was already baked into the arrow files at save time) but is
+    accepted so the call signature mirrors `load_dataset(...)`.
     """
-    # `datasets` ships no type stubs, so we annotate every dataset-typed
-    # local as `Any`. The runtime behaviour is unchanged.
-    from datasets import load_dataset  # type: ignore[import-untyped]
+    import os
 
-    test_ds: Any = load_dataset("cais/mmlu", "all", split="test")
-    dev_ds: Any = load_dataset("cais/mmlu", "all", split="dev")
+    from datasets import load_dataset, load_from_disk  # type: ignore
+
+    if os.path.isdir(local_dir):
+        # The marker files `dataset_info.json` + at least one
+        # `data-*.arrow` shard are the canonical signature of a
+        # `save_to_disk` directory. The shards may live either
+        # directly under `local_dir` (datasets < 3 default) or in a
+        # `data/` subdirectory (datasets >= 3 default), so check
+        # both layouts. Checking the marker files explicitly
+        # avoids loading a half-written directory during a parallel
+        # re-download.
+        has_info = os.path.isfile(os.path.join(local_dir, "dataset_info.json"))
+        has_shard = any(
+            n.startswith("data-") and n.endswith(".arrow")
+            for n in os.listdir(local_dir)
+        ) or any(
+            n.startswith("data-") and n.endswith(".arrow")
+            for n in os.listdir(os.path.join(local_dir, "data"))
+        )
+        if has_info and has_shard:
+            return load_from_disk(local_dir)
+    # Local cache not present (e.g. the user skipped the login-node
+    # pre-download and is running the analyzer somewhere with internet
+    # access). Fall through to the network path.
+    kwargs: dict[str, Any] = {"split": split}
+    if subset is not None:
+        # `datasets >= 3` renamed `name=` to `config_name=`; both are
+        # accepted by the current `load_dataset` signature, so prefer
+        # `config_name` and let older releases silently ignore it.
+        kwargs["config_name"] = subset
+        kwargs["name"] = subset
+    return load_dataset(hf_id, **kwargs)
+
+
+def _try_local_or_remote_jsonl(local_path: str, hf_id: str, split: str) -> list[dict]:
+    """Load a per-row JSONL from local cache, or fall back to HF Hub.
+
+    The Spartan pre-download for PopQA / INCLUDE writes a single
+    `popqa.jsonl` / `include.jsonl` file with one row per question
+    (see `spartan/download-popqa.py` and
+    `spartan/download-include.py`). When the file is present we read
+    it directly; otherwise we fall back to a network load via
+    `datasets.load_dataset` (only reachable on a host with internet).
+
+    Returns the raw list of dicts (no schema validation; the C++
+    sister-project's row format is mirrored here so the two stay
+    byte-compatible).
+    """
+    import os
+
+    from datasets import load_dataset  # type: ignore
+
+    if os.path.isfile(local_path):
+        rows: list[dict] = []
+        with open(local_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rows.append(json.loads(line))
+        return rows
+    # Local cache not present - fall through to the network path.
+    return list(load_dataset(hf_id, split=split))
+
+
+def _tokenize_prompts(
+    tokenizer: Any, prompts: Sequence[str], add_bos: bool
+) -> list[int]:
+    """Tokenize a list of prompts and return the per-prompt prefill length.
+
+    Used to populate `BenchmarkRow.prefill_tokens` for the loaders that
+    build long multi-shot prompts (mmlu 5-shot, bbh 5-shot, include 5-shot).
+    We need the exact prefill token count to populate the per-row
+    `n_tokens` / `n_tokens_prefill` field matching the llama-cpp binary.
+
+    The tokenizer is the vLLM `LLM.get_tokenizer()` instance - it exposes
+    the same `encode(..., add_special_tokens=...)` API as a HF tokenizer.
+    """
+    out: list[int] = []
+    for p in prompts:
+        ids = tokenizer.encode(p, add_special_tokens=add_bos)
+        out.append(len(ids))
+    return out
+
+
+def load_mmlu_prompts(
+    num_samples: int, seed: int, n_shot: int = 5
+) -> BenchmarkPrompts:
+    """Load `num_samples` random MMLU test prompts, grouped per subject.
+
+    Returns a `BenchmarkPrompts` with one `BenchmarkRow` per MMLU
+    subject that appears in the 256-sample (typically up to 57
+    subjects; some get 4-5 questions, others get fewer). Each row's
+    `prompts` is a list of MMLU `n_shot`-shot formatted questions
+    (default 5, matching the standard MMLU evaluation prompt;
+    pass `--n-shots 0` for zero-shot). Token counts are pre-tokenised
+    at load time so the per-row `n_tokens` matches the actual prompt
+    length vLLM sees.
+    """
+    test_ds: Any = _try_local_or_remote(
+        local_dir=f"{DEFAULT_DATASET_DIR}/mmlu/test",
+        hf_id="cais/mmlu",
+        subset="all",
+        split="test",
+    )
+    dev_ds: Any = _try_local_or_remote(
+        local_dir=f"{DEFAULT_DATASET_DIR}/mmlu/dev",
+        hf_id="cais/mmlu",
+        subset="all",
+        split="dev",
+    )
 
     # Group 5-shot examples by subject. Rows are heterogeneous dicts so we
     # annotate as `Any` for the static checker.
@@ -107,24 +366,27 @@ def load_mmlu_prompts(num_samples: int, seed: int) -> BenchmarkPrompts:
     n = len(test_ds)
     # Pre-index examples by their position in the dataset so we can address
     # them in O(1) instead of scanning.
-    # `cast(Iterable[Any], test_ds)` silences the cascade of partial-unknowns
-    # from `enumerate[Unknown] -> list[tuple[int, Unknown]] -> Any`.
     indexed: list[tuple[int, Any]] = list(enumerate(cast(Iterable[Any], test_ds)))
     indices = _sample_indices(n, num_samples, seed)
 
-    prompts: list[str] = []
-    subjects_seen: set[str] = set()
+    # Build per-subject row list. Subjects can repeat (one row per
+    # sampled question within that subject), so we accumulate then
+    # re-key the list to one row per subject.
+    per_subject: dict[str, list[str]] = {}
     for idx in indices:
         _, ex = indexed[idx]
         subject: str = ex["subject"]
-        subjects_seen.add(subject)
-        # Rotate the dev list so we don't always lead with the same 5
-        # examples within a subject.
         dev_list = dev_by_subject[subject]
-        offset = idx % len(dev_list)
-        fewshot = dev_list[offset : offset + 5]
-        if len(fewshot) < 5:
-            fewshot = fewshot + dev_list[: 5 - len(fewshot)]
+        if n_shot > 0:
+            offset = idx % len(dev_list)
+            fewshot = dev_list[offset : offset + n_shot]
+            if len(fewshot) < n_shot:
+                # Subject's dev pool is smaller than `n_shot`. Wrap around
+                # to the start of the same pool so we still get a full
+                # `n_shot`-shot prompt.
+                fewshot = fewshot + dev_list[: n_shot - len(fewshot)]
+        else:
+            fewshot = []
 
         prompt = MMLU_5SHOT_TEMPLATE.format(subject=subject)
         for fs in fewshot:
@@ -143,50 +405,263 @@ def load_mmlu_prompts(num_samples: int, seed: int) -> BenchmarkPrompts:
             c=ex["choices"][2],
             d=ex["choices"][3],
         )
-        prompts.append(prompt)
+        per_subject.setdefault(subject, []).append(prompt)
 
+    rows: list[BenchmarkRow] = []
+    for subj in sorted(per_subject):
+        rows.append(BenchmarkRow(key=subj, prompts=per_subject[subj]))
     return BenchmarkPrompts(
         name="mmlu",
-        prompts=prompts,
-        extra={"subjects_seen": len(subjects_seen)},
+        record_key="subjects",
+        rows=rows,
+        arch_name="olmoe",  # default; downstream tools can re-derive
     )
 
 
-def load_bbh_prompts(num_samples: int, seed: int) -> BenchmarkPrompts:
-    """Load `num_samples` random prompts from the 27 BBH sub-tasks."""
+def load_bbh_prompts(num_samples: int, seed: int, n_shot: int = 5) -> BenchmarkPrompts:
+    """Load `num_samples` random BBH prompts, grouped per sub-task.
 
-    from datasets import get_dataset_config_names, load_dataset  # type: ignore
+    Returns a `BenchmarkPrompts` with one `BenchmarkRow` per BBH
+    sub-task (up to 27; `few_shot_prompts` is filtered). Each row
+    contains the 0-shot question text (the C++ binary also runs
+    0-shot for BBH; we keep the same default for vLLM parity).
+    `n_shot` is accepted for signature parity with the other loaders
+    but is ignored - BBH ships its own per-task few-shot exemplars
+    that are baked into the prompt text on the HF Hub side.
+    """
+    hf_id = "Joschka/big_bench_hard"
+    local_root = f"{DEFAULT_DATASET_DIR}/bbh"
+    subsets: list[str] = []
+    if os.path.isdir(local_root):
+        for entry in sorted(os.listdir(local_root)):
+            if entry == "few_shot_prompts":
+                continue
+            if os.path.isdir(os.path.join(local_root, entry, "test")):
+                subsets.append(entry)
+    if not subsets:
+        from datasets import get_dataset_config_names  # type: ignore
 
-    subsets: list[str] = list(get_dataset_config_names("Joschka/big_bench_hard"))
-    # Concatenate per-subset examples into a flat list, then sample from it.
-    all_examples: list[dict[str, str]] = []
+        subsets = [
+            c
+            for c in get_dataset_config_names(hf_id)
+            if c != "few_shot_prompts"
+        ]
+
+    # Per-subset example list, then we sample N total across all
+    # subsets and regroup by subset key for the output rows.
+    per_subset: dict[str, list[str]] = {}
     for subset in subsets:
-        ds: Any = load_dataset("Joschka/big_bench_hard", subset, split="test")
+        local_dir = f"{local_root}/{subset}/test"
+        ds: Any = _try_local_or_remote(
+            local_dir=local_dir,
+            hf_id=hf_id,
+            subset=subset,
+            split=subset,
+        )
+        # `Joschka/big_bench_hard` exposes the user-facing prompt
+        # under the column name `input` on older `datasets` releases
+        # and `question` on `datasets >= 3`. Accept both.
+        prompt_key = "input" if "input" in ds.column_names else "question"
         for ex in ds:
-            all_examples.append({"input": ex["input"], "target": ex["target"]})
+            per_subset.setdefault(subset, []).append(ex[prompt_key])
 
+    # Sample num_samples across the concatenation of all subsets, then
+    # regroup by subset key.
+    all_examples: list[tuple[str, str]] = []
+    for subset, prompts in per_subset.items():
+        for p in prompts:
+            all_examples.append((subset, p))
     indices = _sample_indices(len(all_examples), num_samples, seed)
-    prompts = [all_examples[i]["input"] for i in indices]
+    sampled = [all_examples[i] for i in indices]
 
+    grouped: dict[str, list[str]] = {}
+    for subset, p in sampled:
+        grouped.setdefault(subset, []).append(p)
+
+    rows: list[BenchmarkRow] = []
+    for subset in sorted(grouped):
+        rows.append(BenchmarkRow(key=subset, prompts=grouped[subset]))
     return BenchmarkPrompts(
         name="bbh",
-        prompts=prompts,
-        extra={"num_subsets_used": len(subsets)},
+        record_key="subjects",
+        rows=rows,
+        arch_name="olmoe",
     )
 
 
-def load_humaneval_prompts(num_samples: int, seed: int) -> BenchmarkPrompts:
-    """Load `num_samples` random HumanEval prompts (function signature + docstring)."""
-    from datasets import load_dataset  # type: ignore[import-untyped]
+def load_humaneval_prompts(
+    num_samples: int, seed: int, n_shot: int = 5
+) -> BenchmarkPrompts:
+    """Load `num_samples` random HumanEval prompts, one record per problem.
 
-    ds: Any = load_dataset("openai/openai_humaneval", split="test")
+    Each `BenchmarkRow` key is `HumanEval/<task_id>` (matches the
+    llama-cpp binary's row key format) and contains a single prompt
+    (the function signature + docstring). The full HumanEval set
+    has 164 problems; if `num_samples >= 164` we keep them all.
+    `n_shot` is accepted for signature parity but HumanEval is a
+    pure-completion benchmark with no few-shot exemplars.
+    """
+    ds: Any = _try_local_or_remote(
+        local_dir=f"{DEFAULT_DATASET_DIR}/humaneval/test",
+        hf_id="openai/openai_humaneval",
+        subset=None,
+        split="test",
+    )
+
     indices = _sample_indices(len(ds), num_samples, seed)
-    prompts = [ds[i]["prompt"] for i in indices]
-
+    rows: list[BenchmarkRow] = []
+    for i in indices:
+        rows.append(
+            BenchmarkRow(
+                key=f"HumanEval/{ds[i]['task_id']}",
+                prompts=[ds[i]["prompt"]],
+            )
+        )
     return BenchmarkPrompts(
         name="humaneval",
-        prompts=prompts,
-        extra={"total_available": len(ds)},
+        record_key="tasks",
+        rows=rows,
+        arch_name="olmoe",
+    )
+
+
+def load_popqa_prompts(
+    num_samples: int, seed: int, n_shot: int = 5
+) -> BenchmarkPrompts:
+    """Load PopQA questions, one record per relation type (prop).
+
+    Each `BenchmarkRow` key is the relation type (e.g. `occupation`,
+    `place_of_birth`). The prompt format is a constrained
+    `completion` style: "Q: ...\nA:" (matches the C++ binary's
+    `prompt_format = "completion_constrained"`). `num_samples` is
+    taken as a soft per-prop budget and subsampled evenly across
+    props (matches `download_popqa.py --limit N`). `n_shot` is
+    accepted for signature parity but PopQA is a pure-completion
+    benchmark with no few-shot exemplars.
+    """
+    hf_id = "akariasai/PopQA"
+    local_jsonl = f"{DEFAULT_DATASET_DIR}/popqa/popqa.jsonl"
+    try:
+        rows_raw = _try_local_or_remote_jsonl(local_jsonl, hf_id, "test")
+    except Exception:
+        rows_raw = []
+
+    if not rows_raw:
+        from datasets import load_dataset  # type: ignore
+
+        rows_raw = list(load_dataset(hf_id, split="test"))
+
+    # Group by prop.
+    by_prop: dict[str, list[dict]] = {}
+    for r in rows_raw:
+        by_prop.setdefault(r["prop"], []).append(r)
+
+    # Subsample per-prop evenly if num_samples is a per-prop budget.
+    per_prop: dict[str, list[dict]] = {}
+    if num_samples > 0:
+        for prop, items in sorted(by_prop.items()):
+            n = min(num_samples, len(items))
+            # Deterministic subsample by question text (matches the
+            # `download_popqa.py --limit` ordering).
+            items_sorted = sorted(items, key=lambda r: r.get("question", ""))
+            per_prop[prop] = items_sorted[:n]
+
+    def _build_prompt(r: dict) -> str:
+        q = str(r.get("question", "")).strip()
+        return f"Q: {q}\nA:"
+
+    rows: list[BenchmarkRow] = []
+    for prop in sorted(per_prop):
+        rows.append(
+            BenchmarkRow(
+                key=prop,
+                prompts=[_build_prompt(r) for r in per_prop[prop]],
+            )
+        )
+    return BenchmarkPrompts(
+        name="popqa",
+        record_key="props",
+        rows=rows,
+        arch_name="olmoe",
+    )
+
+
+def load_include_prompts(
+    num_samples: int, seed: int, n_shot: int = 5
+) -> BenchmarkPrompts:
+    """Load INCLUDE questions, one record per (language, domain) group.
+
+    Each `BenchmarkRow` key is `<language>::<domain>`. `n_shot`-shot
+    from the same (lang, dom) group, formatted like MMLU (Q +
+    A/B/C/D + "Answer:"). `num_samples` is a per-(lang, dom) budget
+    for the **test** rows; the exemplars are drawn from a separate
+    slice of the same group so a row never appears as both exemplar
+    and test item (which would inflate the routing signal on the
+    exemplar's tokens). Test split only (per the paper, validation is
+    a format-error probe).
+    """
+    hf_id = "CohereLabs/include-base-44"
+    local_jsonl = f"{DEFAULT_DATASET_DIR}/include/include.jsonl"
+    try:
+        rows_raw = _try_local_or_remote_jsonl(local_jsonl, hf_id, "test")
+    except Exception:
+        rows_raw = []
+
+    if not rows_raw:
+        from datasets import load_dataset  # type: ignore
+
+        rows_raw = list(load_dataset(hf_id, "Dutch", split="test"))
+
+    # Group by (language, domain).
+    by_langdom: dict[str, list[dict]] = {}
+    for r in rows_raw:
+        if r.get("split", "test") != "test":
+            continue
+        key = f"{r.get('language', '?')}::{r.get('domain', 'Unknown')}"
+        by_langdom.setdefault(key, []).append(r)
+
+    # Sort each group by question for deterministic subsample.
+    for k, v in by_langdom.items():
+        v.sort(key=lambda r: r.get("question", ""))
+
+    # Take `n_shot + num_samples` rows per (lang, dom). The first
+    # `n_shot` rows serve as exemplars; the remaining `num_samples`
+    # rows are the test items. Keeping them disjoint avoids the
+    # contamination where the model's routing signal on the exemplar
+    # tokens gets re-counted on the test prompt that contains them.
+    per_langdom: dict[str, tuple[list[dict], list[dict]]] = {}
+    if num_samples > 0:
+        for key, items in sorted(by_langdom.items()):
+            ex_n = min(n_shot, len(items)) if n_shot > 0 else 0
+            test_n = min(num_samples, len(items) - ex_n)
+            per_langdom[key] = (items[:ex_n], items[ex_n : ex_n + test_n])
+
+    def _build_prompt(test_row: dict, exemplars: list[dict]) -> str:
+        # Mirrors llama-cpp's build_fewshot_user_text: Q + 4 options + "Answer:".
+        parts: list[str] = []
+        for ex in exemplars:
+            parts.append(str(ex.get("question", "")).strip())
+            for opt in ex.get("options", []):
+                parts.append(str(opt))
+            ans = ex.get("answer", 0)
+            letter = chr(ord("A") + int(ans)) if isinstance(ans, int) else "A"
+            parts.append(f"Answer: {letter}\n")
+        parts.append(str(test_row.get("question", "")).strip())
+        for opt in test_row.get("options", []):
+            parts.append(str(opt))
+        parts.append("Answer:")
+        return "\n".join(parts)
+
+    rows: list[BenchmarkRow] = []
+    for key in sorted(per_langdom):
+        exemplars, test_items = per_langdom[key]
+        prompts = [_build_prompt(it, exemplars) for it in test_items]
+        rows.append(BenchmarkRow(key=key, prompts=prompts))
+    return BenchmarkPrompts(
+        name="include",
+        record_key="by_langdom",
+        rows=rows,
+        arch_name="olmoe",
     )
 
 
@@ -194,6 +669,8 @@ BENCHMARK_LOADERS = {
     "mmlu": load_mmlu_prompts,
     "bbh": load_bbh_prompts,
     "humaneval": load_humaneval_prompts,
+    "popqa": load_popqa_prompts,
+    "include": load_include_prompts,
 }
 
 
@@ -207,58 +684,187 @@ def aggregate_expert_counts(
     num_layers: int,
     num_experts: int,
     top_k: int,
-) -> tuple[np.ndarray, int]:
-    """Aggregate per-token topk expert IDs into per-layer counts.
+    row_keys_per_completion: list[str],
+) -> dict[str, Any]:
+    """Aggregate per-token topk expert IDs into per-row + aggregate counts.
 
-    Args:
-        outputs: iterable of `RequestOutput` objects (any object whose
-            `.outputs[i].routed_experts` is a `(seq_len, num_layers, top_k)`
-            array, or `None`).
-        num_layers: number of MoE layers in the model.
-        num_experts: total number of experts per layer.
-        top_k: number of experts selected per token.
+    Walks each `RequestOutput` in `outputs`, then each
+    `completion` inside it. The `routed_experts` tensor on each
+    completion has shape `(seq_len, num_layers, top_k)` (vLLM's
+    `enable_return_routed_experts` contract).
 
-    Returns:
-        Tuple of (counts, total_tokens) where counts has shape
-        `(num_layers, num_experts)` with dtype int64 and total_tokens is the
-        sum of `seq_len` across all prompt+generated tokens routed.
+    For every (token, layer) cell we increment the per-row
+    marginal counter `counts[row_key][layer, expert]` once for each
+    of the `top_k` expert slots. We additionally compute the
+    per-row intra-layer `[L, E, E]` and adjacent-layer `[L-1, E, E]`
+    co-activation pair counts (one increment per token per
+    `(j1, j2) in top_k^2` pair). The pair counts are identical
+    in shape and semantics to the sister-project's C++ binary
+    output so `aggregate_overview.py` consumes them as-is.
+
+    Returns a dict with:
+      * `per_row_counts`     : dict[row_key, np.ndarray (L, E) int64]
+      * `per_row_intra`      : dict[row_key, np.ndarray (L, E, E) int64]
+      * `per_row_adj`        : dict[row_key, np.ndarray (L-1, E, E) int64]
+                              (omitted for the last layer pair; rows
+                              with n_layer < 2 get an empty entry)
+      * `total_prefill_tokens`  : int (sum across all completions)
+      * `total_generated_tokens`: int (sum across all completions)
+      * `marginal`           : np.ndarray (L, E) int64 (sum across rows)
+      * `intra`              : np.ndarray (L, E, E) int64 (sum across rows)
+      * `adj`                : np.ndarray (L-1, E, E) int64 (sum across rows)
+      * `arch_name`          : always "unknown" here; the caller tags
+                              the model arch (used for the JSON
+                              `model_arch.name` field).
+
+    `row_keys_per_completion` is a flat list (one row_key per
+    `RequestOutput`) that the caller builds by walking the
+    `BenchmarkPrompts.rows` in order and concatenating each row's
+    `prompts` list. Completions in `outputs` are then matched
+    positionally to those keys.
     """
-    counts = np.zeros((num_layers, num_experts), dtype=np.int64)
-    total_tokens = 0
+    if num_layers <= 0 or num_experts <= 0 or top_k <= 0:
+        raise ValueError(
+            f"aggregate_expert_counts: bad shape "
+            f"(num_layers={num_layers}, num_experts={num_experts}, top_k={top_k})"
+        )
 
-    for request_output in outputs:
+    # Initialise per-row accumulators lazily so a row with zero
+    # completions still appears in the output (with an all-zero
+    # [L, E] matrix), matching the C++ binary's behaviour. We do the
+    # initialisation up front (before the request walk) so a row that
+    # is requested by `row_keys_per_completion` but never gets a
+    # non-None `routed_experts` still appears in the output.
+    per_row_counts: dict[str, np.ndarray] = {}
+    per_row_intra: dict[str, np.ndarray] = {}
+    per_row_adj: dict[str, np.ndarray] = {}
+    seen_keys: set[str] = set(row_keys_per_completion)
+    for rk in seen_keys:
+        per_row_counts[rk] = np.zeros((num_layers, num_experts), dtype=np.int64)
+        per_row_intra[rk] = np.zeros((num_layers, num_experts, num_experts), dtype=np.int64)
+        if num_layers >= 2:
+            per_row_adj[rk] = np.zeros((num_layers - 1, num_experts, num_experts), dtype=np.int64)
+
+    marginal = np.zeros((num_layers, num_experts), dtype=np.int64)
+    intra = np.zeros((num_layers, num_experts, num_experts), dtype=np.int64)
+    adj = (
+        np.zeros((max(num_layers - 1, 0), num_experts, num_experts), dtype=np.int64)
+        if num_layers >= 2
+        else np.zeros((0, num_experts, num_experts), dtype=np.int64)
+    )
+
+    total_prefill_tokens = 0
+    total_generated_tokens = 0
+
+    # `outputs` is one element per `prompt` in the order we sent them.
+    # Walk it positionally; pair with `row_keys_per_completion`.
+    out_iter = iter(outputs)
+    for completion_idx, request_output in enumerate(out_iter):
+        row_key = row_keys_per_completion[completion_idx]
+
+        # Request-level token accounting. vLLM's `RequestOutput` exposes
+        # `prompt_token_ids` (list[int]) and each `CompletionOutput`
+        # exposes `token_ids` (list[int]) + `finish_reason` for the
+        # prefill + autoregressive decode counts.
+        prompt_token_ids: list[int] = list(
+            getattr(request_output, "prompt_token_ids", []) or []
+        )
+        prefill_n = len(prompt_token_ids)
+        generated_n = 0
+        for completion in request_output.outputs:
+            generated_n += len(getattr(completion, "token_ids", []) or [])
+        total_prefill_tokens += prefill_n
+        total_generated_tokens += generated_n
+
         for completion in request_output.outputs:
             routed: Any = completion.routed_experts
             if routed is None:
                 continue
-            if routed.ndim != 3:
+            arr = np.asarray(routed)
+            if arr.ndim != 3:
                 raise ValueError(
                     f"Expected routed_experts to be 3D "
-                    f"(seq_len, num_layers, top_k); got shape {routed.shape}"
+                    f"(seq_len, num_layers, top_k); got shape {arr.shape}"
                 )
-            if routed.shape[1] != num_layers:
+            if arr.shape[1] != num_layers:
                 raise ValueError(
-                    f"routed_experts has {routed.shape[1]} layers but model "
+                    f"routed_experts has {arr.shape[1]} layers but model "
                     f"config has {num_layers}"
                 )
-            if routed.shape[2] != top_k:
+            if arr.shape[2] != top_k:
                 raise ValueError(
-                    f"routed_experts has top_k={routed.shape[2]} but model "
+                    f"routed_experts has top_k={arr.shape[2]} but model "
                     f"config has top_k={top_k}"
                 )
-            # Flatten per layer: shape (seq_len, num_layers, top_k)
-            # -> per-layer: reshape to (seq_len * top_k, num_layers), then
-            # transpose to (num_layers, seq_len * top_k) and bincount.
-            flat = np.ascontiguousarray(routed).reshape(-1, num_layers, top_k)
+
+            row_counts = per_row_counts[row_key]
+            row_intra = per_row_intra[row_key]
+            row_adj = per_row_adj.get(row_key)
+
+            # Cast to int64 once; downstream code uses np.bincount which
+            # is faster on a contiguous int64 array.
+            flat = np.ascontiguousarray(arr, dtype=np.int64)  # (T, L, K)
+            T = flat.shape[0]
+
+            # Marginal: for each layer, bincount the K expert ids per
+            # token, sum across tokens.
             for layer_id in range(num_layers):
                 layer_ids = flat[:, layer_id, :].ravel()
-                counts[layer_id] += np.bincount(
-                    layer_ids.astype(np.int64, copy=False),
-                    minlength=num_experts,
-                )
-            total_tokens += routed.shape[0]
+                bc = np.bincount(layer_ids, minlength=num_experts)
+                row_counts[layer_id] += bc
+                marginal[layer_id] += bc
 
-    return counts, total_tokens
+            # Intra-layer pair counts: for each layer, for each token,
+            # for each (j1, j2) in top_k^2, increment
+            # `row_intra[L, e1, e2]`. Mirror of the C++ binary's
+            # tally_pairs_for_question() inner loop. Vectorised with
+            # broadcasting on the (T, K) topk slice.
+            for layer_id in range(num_layers):
+                topk = flat[:, layer_id, :]  # (T, K)
+                # bincount on the outer product of (T*K) x (T*K) is O((T*K)^2)
+                # per layer, which is fine for typical prefill lengths
+                # (~1K tokens, K=8 -> 64M ops per layer) and matches the
+                # C++ binary's O(T*K*K) cost. Use np.add.at for unbuffered
+                # scatter to handle repeated expert ids correctly.
+                T_, K_ = topk.shape
+                e1 = np.broadcast_to(topk[:, :, None], (T_, K_, K_)).ravel()
+                e2 = np.broadcast_to(topk[:, None, :], (T_, K_, K_)).ravel()
+                bc = np.bincount(
+                    e1 * num_experts + e2, minlength=num_experts * num_experts
+                )
+                bc_2d = bc.reshape(num_experts, num_experts)
+                row_intra[layer_id] += bc_2d
+                intra[layer_id] += bc_2d
+
+            # Adjacent-layer pair counts: for each (L, L+1) pair,
+            # for each token, for each (j1, j2) in top_k^2, increment
+            # `row_adj[L, e1, e2]`. Same vectorisation as intra.
+            if num_layers >= 2 and row_adj is not None:
+                for L_ in range(num_layers - 1):
+                    e1 = np.broadcast_to(
+                        flat[:, L_, :, None], (T, top_k, top_k)
+                    ).ravel()
+                    e2 = np.broadcast_to(
+                        flat[:, L_ + 1, None, :], (T, top_k, top_k)
+                    ).ravel()
+                    bc = np.bincount(
+                        e1 * num_experts + e2, minlength=num_experts * num_experts
+                    )
+                    bc_2d = bc.reshape(num_experts, num_experts)
+                    row_adj[L_] += bc_2d
+                    adj[L_] += bc_2d
+
+    return {
+        "per_row_counts": per_row_counts,
+        "per_row_intra": per_row_intra,
+        "per_row_adj": per_row_adj,
+        "total_prefill_tokens": total_prefill_tokens,
+        "total_generated_tokens": total_generated_tokens,
+        "marginal": marginal,
+        "intra": intra,
+        "adj": adj,
+        "arch_name": "unknown",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +874,6 @@ def aggregate_expert_counts(
 
 def _read_model_config(model: str) -> tuple[int, int, int]:
     """Read num_experts, num_experts_per_tok, num_hidden_layers from HF config."""
-    # `transformers` ships no type stubs for `from_pretrained`, so cast the
-    # result to `Any` to silence the partial-unknown cascade.
     from transformers import AutoConfig  # type: ignore[import-untyped]
 
     hf_config: Any = cast(
@@ -294,19 +898,11 @@ def _safe_id(name: str, fallback: str = "default") -> str:
     """
     cleaned = "".join(c if c.isalnum() or c in "._-" else "-" for c in name)
     if name != cleaned:
-        # Preserve the slash->double-dash rule explicitly; the alnum
-        # filter above would turn `/` into `-` (single), but the
-        # sister convention is `--`.
         cleaned = name.replace("/", "--")
         cleaned = "".join(c if c.isalnum() or c in "._-" else "-" for c in cleaned)
     if not cleaned:
         return fallback
     return cleaned
-
-
-def _cell_dir(output_dir: Path, model: str, quant: str) -> Path:
-    """Per-(model, quant) directory under `output_dir`."""
-    return output_dir / _safe_id(model) / _safe_id(quant)
 
 
 def _build_llm(
@@ -348,6 +944,137 @@ def _build_llm(
     return LLM(**kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Per-benchmark driver
+# ---------------------------------------------------------------------------
+
+
+def _matrix_to_nested_list(arr: np.ndarray) -> list[list[int]]:
+    """Cast a 2D int64 array to a nested list of Python ints for JSON."""
+    return [[int(v) for v in row] for row in arr]
+
+
+def _matrix3d_to_nested_list(arr: np.ndarray) -> list[list[list[int]]]:
+    """Cast a 3D int64 array to a nested list of Python ints for JSON."""
+    return [
+        [[int(v) for v in col] for col in row]
+        for row in arr
+    ]
+
+
+def _write_per_benchmark_json(
+    out_path: Path,
+    model: str,
+    arch_name: str,
+    quant: str,
+    benchmark: BenchmarkPrompts,
+    num_layers: int,
+    num_experts: int,
+    top_k: int,
+    num_samples: int,
+    n_shot: int,
+    agg: dict[str, Any],
+) -> None:
+    """Write the llama-cpp-compatible `expert_counts.json` for one cell.
+
+    Schema is documented in `examples/eval-moe/README.md`. Brief summary:
+    * `model` / `model_arch` / `config` / `totals` mirror the C++ binary.
+    * `aggregate` block holds dataset-wide marginal + pair counts so
+      `aggregate_overview.py` can produce its `overall/` overview
+      without re-aggregating from per-row records.
+    * The top-level record key (`subjects` / `tasks` / `props` /
+      `by_langdom`) holds one entry per row, each with `layer_expert_counts`,
+      `intra_pair_counts`, `adjacent_pair_counts`, plus per-benchmark
+      token accounting (`n_tokens` for mmlu/bbh; `n_tokens_prefill` +
+      `n_tokens_generated` for humaneval/popqa/include).
+    """
+    record_key = benchmark.record_key
+    run_key = BENCHMARK_RUN_KEY[benchmark.name]
+    questions_config_key = BENCHMARK_QUESTIONS_CONFIG_KEY[benchmark.name]
+    prompt_format = BENCHMARK_PROMPT_FORMAT[benchmark.name]
+    fewshot_pool = BENCHMARK_FEWSHOT_POOL[benchmark.name]
+
+    # Per-row record dict.
+    per_row_records: dict[str, dict[str, Any]] = {}
+    for row in benchmark.rows:
+        per_key = agg["per_row_counts"][row.key]
+        per_key_intra = agg["per_row_intra"][row.key]
+        per_key_adj = agg["per_row_adj"].get(row.key)
+        rec: dict[str, Any] = {
+            "questions": len(row.prompts),
+            "layer_expert_counts": _matrix_to_nested_list(per_key),
+            "intra_pair_counts": _matrix3d_to_nested_list(per_key_intra),
+        }
+        if per_key_adj is not None and per_key_adj.shape[0] > 0:
+            rec["adjacent_pair_counts"] = _matrix3d_to_nested_list(per_key_adj)
+        else:
+            rec["adjacent_pair_counts"] = []
+
+        # Token accounting: MMLU + BBH use `n_tokens` (prefill only;
+        # no autoregressive decode). HumanEval + PopQA + INCLUDE use
+        # the explicit `n_tokens_prefill` + `n_tokens_generated` pair
+        # so downstream tools can reconstruct total token volume.
+        if benchmark.name in ("mmlu", "bbh"):
+            rec["n_tokens"] = int(per_key.sum())
+        else:
+            # Use the row-level prefill / generated counts captured at
+            # the vLLM boundary via `request_output.prompt_token_ids`
+            # and `completion.token_ids`. The aggregate function
+            # already summed these into the global totals; we
+            # attribute per-row by averaging the row's prefill across
+            # its completions (good enough for the routing stats use
+            # case - per-row prefill vs generated split is informational).
+            # The exact per-row split is captured by the row's
+            # `prefill_tokens` / `generated_tokens` set at load time
+            # (from the tokenizer) - we use that for accuracy.
+            rec["n_tokens_prefill"] = int(row.prefill_tokens)
+            rec["n_tokens_generated"] = int(row.generated_tokens)
+        per_row_records[row.key] = rec
+
+    totals = {
+        run_key: len(per_row_records),
+        "questions_total": int(sum(r["questions"] for r in per_row_records.values())),
+        "tokens_total": int(agg["total_prefill_tokens"] + agg["total_generated_tokens"]),
+    }
+
+    config: dict[str, Any] = {
+        questions_config_key: num_samples,
+        "prompt_format": prompt_format,
+    }
+    if n_shot > 0:
+        config["n_shot"] = n_shot
+    if fewshot_pool:
+        config["few_shot_pool"] = fewshot_pool
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "model_arch": {
+            "name": arch_name,
+            "n_layer": num_layers,
+            "n_expert": num_experts,
+            "n_expert_used": top_k,
+        },
+        "config": config,
+        "totals": totals,
+        "aggregate": {
+            "marginal_expert_counts": _matrix_to_nested_list(agg["marginal"]),
+            "intra_pair_counts": _matrix3d_to_nested_list(agg["intra"]),
+            "adjacent_pair_counts": _matrix3d_to_nested_list(agg["adj"]),
+        },
+        record_key: per_row_records,
+    }
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(payload, f, indent=2)
+
+
 def _run_benchmark(
     llm: Any,
     benchmark: BenchmarkPrompts,
@@ -357,86 +1084,103 @@ def _run_benchmark(
     top_k: int,
     model: str,
     quant: str,
-) -> dict[str, Any]:
-    """Run one benchmark and aggregate per-layer expert counts."""
+    num_samples: int,
+    n_shot: int,
+    tokenizer: Any,
+    output_dir: Path,
+) -> None:
+    """Run one benchmark, aggregate, and write the per-cell JSON.
+
+    Flattens `benchmark.rows` into a single `prompts` list, runs
+    `llm.generate(...)` on it, then aggregates per-token routed
+    experts into the per-row + aggregate count matrices and writes
+    them to `<output-dir>/<model_safe>/<quant_safe>/moe-<bench>/expert_counts.json`.
+    """
+    # Flatten rows into a single prompts list; record the row key
+    # for each prompt position so we can route the per-completion
+    # counts back to the right per-row matrix.
+    prompts: list[str] = []
+    row_keys_per_completion: list[str] = []
+    for row in benchmark.rows:
+        # Refresh the row's prefill token count from the vLLM tokenizer
+        # (more accurate than a static precompute). vLLM's tokenizer
+        # attribute path has changed across releases: in some it's
+        # `llm.llm_engine.tokenizer.tokenizer`, in newer releases it's
+        # `llm.get_tokenizer()` (the stable public API) wrapped in a
+        # pool with a `_tokenizer` attribute. We use the public
+        # `llm.get_tokenizer()` API and probe for the inner tokenizer
+        # via `_tokenizer` (newer) or `tokenizer` (older) so we work
+        # across vLLM versions.
+        tokenizer_obj = llm.get_tokenizer()
+        inner = getattr(tokenizer_obj, "_tokenizer", None) or getattr(
+            tokenizer_obj, "tokenizer", None
+        ) or tokenizer_obj
+        add_bos = bool(getattr(inner, "add_bos_token", False))
+        per_prompt_prefill = _tokenize_prompts(tokenizer_obj, row.prompts, add_bos)
+        row.prefill_tokens = sum(per_prompt_prefill)
+        # `generated_tokens` is the model's `max_tokens` cap; the actual
+        # generated count comes back from `aggregate_expert_counts`
+        # via `RequestOutput.outputs[i].token_ids`. We initialise to 0
+        # and let the aggregation overwite it; the JSON write uses the
+        # aggregated value, not this initial.
+        row.generated_tokens = 0
+        for p in row.prompts:
+            prompts.append(p)
+            row_keys_per_completion.append(row.key)
+
     logger.info(
-        "Running benchmark %s with %d prompts...",
+        "Running benchmark %s: %d row(s), %d prompt(s) total",
         benchmark.name,
-        len(benchmark.prompts),
+        len(benchmark.rows),
+        len(prompts),
     )
-    outputs: Any = llm.generate(benchmark.prompts, sampling_params, use_tqdm=False)
-    counts, total_tokens = aggregate_expert_counts(
-        outputs,
+    outputs: Any = llm.generate(prompts, sampling_params, use_tqdm=False)
+
+    agg = aggregate_expert_counts(
+        outputs=outputs,
         num_layers=num_layers,
         num_experts=num_experts,
         top_k=top_k,
+        row_keys_per_completion=row_keys_per_completion,
     )
 
-    expert_counts: dict[str, dict[str, int]] = {}
-    for layer_id in range(num_layers):
-        expert_counts[str(layer_id)] = {
-            str(expert_id): int(counts[layer_id, expert_id])
-            for expert_id in range(num_experts)
-        }
+    # Refine per-row `generated_tokens` from the actual completions:
+    # the row-level count we wrote above was 0; we now set it from
+    # the vLLM-side actual generated count by walking the outputs
+    # again. (For HumanEval / PopQA / INCLUDE we want the actual
+    # generated count, not the cap, so the JSON's
+    # `n_tokens_generated` reflects what was really decoded.)
+    generated_per_row: dict[str, int] = {rk: 0 for rk in agg["per_row_counts"]}
+    for completion_idx, request_output in enumerate(outputs):
+        rk = row_keys_per_completion[completion_idx]
+        for completion in request_output.outputs:
+            generated_per_row[rk] = generated_per_row.get(rk, 0) + len(
+                getattr(completion, "token_ids", []) or []
+            )
+    for row in benchmark.rows:
+        row.generated_tokens = generated_per_row.get(row.key, 0)
 
-    return {
-        "benchmark": benchmark.name,
-        "model": model,
-        "quant": quant,
-        "num_samples": len(benchmark.prompts),
-        "num_layers": num_layers,
-        "num_experts": num_experts,
-        "top_k": top_k,
-        "total_tokens": total_tokens,
-        "expert_counts": expert_counts,
-        "extra": benchmark.extra,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        json.dump(payload, f, indent=2)
-
-
-def _write_summary(
-    output_dir: Path,
-    model: str,
-    quant: str,
-    per_benchmark_results: Sequence[dict[str, Any]],
-    num_layers: int,
-    num_experts: int,
-    top_k: int,
-) -> None:
-    """Write a per-layer summary aggregating across benchmarks."""
-    grand_total = np.zeros((num_layers, num_experts), dtype=np.int64)
-    for result in per_benchmark_results:
-        for layer_id in range(num_layers):
-            counts = result["expert_counts"][str(layer_id)]
-            for expert_id, count in counts.items():
-                grand_total[layer_id, int(expert_id)] += count
-
-    summary: dict[str, Any] = {
-        "model": model,
-        "quant": quant,
-        "num_layers": num_layers,
-        "num_experts": num_experts,
-        "top_k": top_k,
-        "benchmarks": [r["benchmark"] for r in per_benchmark_results],
-        "expert_counts": {
-            str(layer_id): {
-                str(expert_id): int(grand_total[layer_id, expert_id])
-                for expert_id in range(num_experts)
-            }
-            for layer_id in range(num_layers)
-        },
-    }
-    _write_json(output_dir / "summary.json", summary)
+    out_path = output_dir / _safe_id(model) / _safe_id(quant) / f"moe-{benchmark.name}" / "expert_counts.json"
+    _write_per_benchmark_json(
+        out_path=out_path,
+        model=model,
+        arch_name=benchmark.arch_name,
+        quant=quant,
+        benchmark=benchmark,
+        num_layers=num_layers,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_samples=num_samples,
+        n_shot=n_shot,
+        agg=agg,
+    )
+    logger.info(
+        "Wrote %s (rows=%d, tokens_prefill=%d, tokens_generated=%d)",
+        out_path,
+        len(benchmark.rows),
+        agg["total_prefill_tokens"],
+        agg["total_generated_tokens"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -447,9 +1191,11 @@ def _write_summary(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one or more MoE models over MMLU/BBH/HumanEval and write "
-            "per-layer expert activation statistics for every "
-            "(model, quant) cell."
+            "Run one or more MoE models over MMLU/BBH/HumanEval/PopQA/INCLUDE "
+            "and write per-layer expert activation statistics (with pair counts) "
+            "for every (model, quant, benchmark) cell, in the same JSON schema as "
+            "the sister llama-cpp-eval C++ binaries so the same post-processing "
+            "toolchain can consume both."
         )
     )
     parser.add_argument(
@@ -480,19 +1226,28 @@ def _parse_args() -> argparse.Namespace:
         nargs="+",
         default=list(DEFAULT_BENCHMARKS),
         choices=sorted(BENCHMARK_LOADERS),
-        help="Which benchmarks to run.",
+        help="Which benchmarks to run (subset of {mmlu, bbh, humaneval, popqa, include}).",
     )
     parser.add_argument("--num-samples", type=int, default=DEFAULT_NUM_SAMPLES)
-    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Autoregressive decode cap per prompt (default 256). Set 0 for prefill-only.",
+    )
+    parser.add_argument(
+        "--n-shots",
+        type=int,
+        default=5,
+        help="Few-shot exemplars from the per-dataset dev pool (mmlu, bbh, include). 0 for zero-shot.",
+    )
     parser.add_argument(
         "--output-dir",
         default="./expert_stats",
         help=(
             "Parent directory for the output tree. Each cell lands at "
-            "<output-dir>/<model_safe>/<quant_safe>/<benchmark>.json "
-            "+ summary.json. <model_safe> is the HF repo id with '/' "
-            "replaced by '--'; <quant_safe> is the quant tag (or "
-            "'default' if --quant is empty)."
+            "<output-dir>/<model_safe>/<quant_safe>/moe-<bench>/expert_counts.json. "
+            "Can be overridden via EVAL_MOE_OUTPUT_DIR for sbatch integration."
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -507,9 +1262,7 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Number of GPUs to spread each model across (vLLM's "
             "tensor_parallel_size). Default 1. Set to NGPUS from the "
-            "sbatch to use the full GPU allocation. NVLink between "
-            "GPUs gives ~600 GB/s tensor parallel BW; PCIe gives "
-            "~32 GB/s and is generally too slow for 70B+ models."
+            "sbatch to use the full GPU allocation."
         ),
     )
     return parser.parse_args()
@@ -566,14 +1319,19 @@ def main() -> None:
                 tensor_parallel_size=args.tensor_parallel_size,
             )
 
-            cell_dir = _cell_dir(output_dir, model, quant)
-            cell_dir.mkdir(parents=True, exist_ok=True)
+            # Tokenizer for per-prompt prefill counts (so the
+            # per-row `n_tokens_prefill` field matches what vLLM
+            # actually sees).
+            tokenizer = llm.get_tokenizer()
 
-            per_benchmark_results: list[dict[str, Any]] = []
             for benchmark_name in args.benchmarks:
                 loader = BENCHMARK_LOADERS[benchmark_name]
-                benchmark = loader(num_samples=args.num_samples, seed=args.seed)
-                result = _run_benchmark(
+                benchmark = loader(
+                    num_samples=args.num_samples,
+                    seed=args.seed,
+                    n_shot=args.n_shots,
+                )
+                _run_benchmark(
                     llm=llm,
                     benchmark=benchmark,
                     sampling_params=sampling_params,
@@ -582,50 +1340,21 @@ def main() -> None:
                     top_k=num_experts_per_tok,
                     model=model,
                     quant=quant,
+                    num_samples=args.num_samples,
+                    n_shot=args.n_shots,
+                    tokenizer=tokenizer,
+                    output_dir=output_dir,
                 )
-                _write_json(cell_dir / f"{benchmark_name}.json", result)
-                per_benchmark_results.append(result)
-                logger.info(
-                    "Wrote %s with %d tokens across %d layers.",
-                    cell_dir / f"{benchmark_name}.json",
-                    result["total_tokens"],
-                    result["num_layers"],
-                )
-
-            _write_summary(
-                output_dir=cell_dir,
-                model=model,
-                quant=quant,
-                per_benchmark_results=per_benchmark_results,
-                num_layers=num_hidden_layers,
-                num_experts=num_experts,
-                top_k=num_experts_per_tok,
-            )
-            logger.info("Wrote %s", cell_dir / "summary.json")
 
             # Free GPU memory + tear down torch.distributed before the
             # next cell so two models don't have to fit in VRAM
-            # simultaneously. vLLM's LLM class does not expose a
-            # public shutdown() - we have to rely on GC + an explicit
-            # empty_cache() call. Without the cache flush, the next
-            # cell's LLM(...) would OOM even though `del llm` cleared
-            # the Python reference, because PyTorch's caching
-            # allocator holds onto the freed blocks. On multi-GPU
-            # runs, vLLM's LLMEngine also spins up a torch.distributed
-            # process group; we destroy it explicitly here so the
-            # next cell can spin up a fresh one with a different
-            # world_size.
+            # simultaneously.
             import gc
-
             import torch
 
             del llm
             gc.collect()
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                # `destroy_process_group` is best-effort cleanup; some
-                # versions raise if no group was ever created. We use
-                # contextlib.suppress rather than try/except/pass to
-                # satisfy ruff's SIM105 and to make the intent clear.
                 with contextlib.suppress(Exception):
                     torch.distributed.destroy_process_group()
             if torch.accelerator.is_available():
