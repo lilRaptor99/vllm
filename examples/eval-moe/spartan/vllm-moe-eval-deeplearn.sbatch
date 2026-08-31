@@ -131,7 +131,9 @@
 # edit the value below AND keep NGPUS in sync (the body uses NGPUS
 # to auto-derive the tensor split, etc.). Default 1 = single GPU.
 #SBATCH --job-name=vllm-moe-eval
-#SBATCH --partition=gpu-a100
+#SBATCH --partition=deeplearn
+#SBATCH --qos=gpgpudeeplearn
+#SBATCH --constraint=dlg5
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=120G

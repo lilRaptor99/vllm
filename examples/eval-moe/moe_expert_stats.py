@@ -37,7 +37,7 @@ Per-row record keys follow the convention from
   * MMLU  -> "subjects"   (key = MMLU subject name)
   * BBH   -> "subjects"   (key = BBH sub-task name; `few_shot_prompts`
                             filtered)
-  * HumanEval -> "tasks"  (key = "HumanEval/<task_id>")
+  * HumanEval -> "tasks"  (key = task_id, e.g. "HumanEval/146")
   * PopQA -> "props"     (key = PopQA relation type, e.g. "occupation")
   * INCLUDE -> "by_langdom"  (key = "<language>::<domain>")
 
@@ -494,12 +494,14 @@ def load_humaneval_prompts(
 ) -> BenchmarkPrompts:
     """Load `num_samples` random HumanEval prompts, one record per problem.
 
-    Each `BenchmarkRow` key is `HumanEval/<task_id>` (matches the
-    llama-cpp binary's row key format) and contains a single prompt
-    (the function signature + docstring). The full HumanEval set
-    has 164 problems; if `num_samples >= 164` we keep them all.
-    `n_shot` is accepted for signature parity but HumanEval is a
-    pure-completion benchmark with no few-shot exemplars.
+    Each `BenchmarkRow` key is the HumanEval `task_id` directly
+    (e.g. `"HumanEval/146"` — matches the C++ sister binary's row
+    key format; the upstream HF column already carries the
+    `"HumanEval/"` prefix, so we don't add it again). The full
+    HumanEval set has 164 problems; if `num_samples >= 164` we keep
+    them all. `n_shot` is accepted for signature parity but
+    HumanEval is a pure-completion benchmark with no few-shot
+    exemplars.
     """
     ds: Any = _try_local_or_remote(
         local_dir=f"{DEFAULT_DATASET_DIR}/humaneval/test",
@@ -513,7 +515,7 @@ def load_humaneval_prompts(
     for i in indices:
         rows.append(
             BenchmarkRow(
-                key=f"HumanEval/{ds[i]['task_id']}",
+                key=str(ds[i]["task_id"]),
                 prompts=[ds[i]["prompt"]],
             )
         )
@@ -873,16 +875,50 @@ def aggregate_expert_counts(
 
 
 def _read_model_config(model: str) -> tuple[int, int, int]:
-    """Read num_experts, num_experts_per_tok, num_hidden_layers from HF config."""
+    """Read num_experts, num_experts_per_tok, num_hidden_layers from HF config.
+
+    `trust_remote_code=True` is required for architectures like DeepSeek-MoE
+    that ship custom modeling code on the Hub. Without it, AutoConfig raises
+    on a non-interactive stdin (SLURM jobs have no TTY), so the prompt for
+    trust confirmation EOFs before the user can answer.
+
+    Different MoE architectures name these fields differently:
+      - OLMoE / gpt-oss : num_experts
+      - Mixtral         : num_local_experts
+      - DeepSeek-MoE    : n_routed_experts (plus n_shared_experts, but those
+                          are NOT in vLLM's routed_experts tensor — they're
+                          always-on experts, not part of the routing pool)
+
+    The values are used downstream as the bincount minlength / matrix shape
+    in `aggregate_expert_counts`, so they must match the cardinality of the
+    IDs that vLLM actually emits in `routed_experts` for that architecture.
+    """
     from transformers import AutoConfig  # type: ignore[import-untyped]
 
     hf_config: Any = cast(
         Any,
-        AutoConfig.from_pretrained(model),  # type: ignore[no-untyped-def]
+        AutoConfig.from_pretrained(model, trust_remote_code=True),  # type: ignore[no-untyped-def]
     )
-    num_experts = int(hf_config.num_experts)
-    num_experts_per_tok = int(hf_config.num_experts_per_tok)
-    num_hidden_layers = int(hf_config.num_hidden_layers)
+
+    def _resolve(candidates: list[str]) -> int:
+        for name in candidates:
+            if hasattr(hf_config, name):
+                v = getattr(hf_config, name)
+                if v is not None:
+                    return int(v)
+        available = sorted(
+            k for k in vars(hf_config).keys()
+            if "expert" in k.lower() or "hidden" in k.lower() or "layer" in k.lower()
+        )
+        raise AttributeError(
+            f"{model!r}: none of {candidates} found on the HF config "
+            f"(model_type={getattr(hf_config, 'model_type', '?')!r}). "
+            f"Available expert/layer/hidden attrs: {available}"
+        )
+
+    num_experts = _resolve(["n_routed_experts", "num_experts", "num_local_experts"])
+    num_experts_per_tok = _resolve(["num_experts_per_tok", "top_k"])
+    num_hidden_layers = _resolve(["num_hidden_layers", "n_layer", "num_layers"])
     return num_experts, num_experts_per_tok, num_hidden_layers
 
 
@@ -926,6 +962,10 @@ def _build_llm(
     vLLM automatically picks the right distributed executor based on
     the visible GPUs (multi-GPU + NVLink uses the V1 engine's
     tensor-parallel path; single-GPU is a no-op).
+
+    `trust_remote_code=True` is forwarded so architectures that ship
+    custom modeling code on the Hub (e.g. DeepSeek-MoE) load without an
+    interactive prompt — SLURM jobs have no TTY, so a prompt would EOF.
     """
     from vllm import LLM
 
@@ -938,6 +978,7 @@ def _build_llm(
         "enforce_eager": enforce_eager,
         "seed": seed,
         "tensor_parallel_size": tensor_parallel_size,
+        "trust_remote_code": True,
     }
     if quant:
         kwargs["quantization"] = quant
@@ -996,10 +1037,25 @@ def _write_per_benchmark_json(
 
     # Per-row record dict.
     per_row_records: dict[str, dict[str, Any]] = {}
+    L = num_layers
+    E = num_experts
     for row in benchmark.rows:
-        per_key = agg["per_row_counts"][row.key]
-        per_key_intra = agg["per_row_intra"][row.key]
-        per_key_adj = agg["per_row_adj"].get(row.key)
+        # The defensive prompt-length filter can drop all prompts in
+        # a row, in which case the row's key never makes it into
+        # `agg["per_row_counts"]`. Synthesise an all-zero record so
+        # the JSON's per-row shape stays consistent.
+        if row.key in agg["per_row_counts"]:
+            per_key = agg["per_row_counts"][row.key]
+            per_key_intra = agg["per_row_intra"][row.key]
+            per_key_adj = agg["per_row_adj"].get(row.key)
+        else:
+            per_key = np.zeros((L, E), dtype=np.int64)
+            per_key_intra = np.zeros((L, E, E), dtype=np.int64)
+            per_key_adj = (
+                np.zeros((max(L - 1, 0), E, E), dtype=np.int64)
+                if L >= 2
+                else None
+            )
         rec: dict[str, Any] = {
             "questions": len(row.prompts),
             "layer_expert_counts": _matrix_to_nested_list(per_key),
@@ -1088,6 +1144,8 @@ def _run_benchmark(
     n_shot: int,
     tokenizer: Any,
     output_dir: Path,
+    max_model_len: int,
+    max_tokens: int,
 ) -> None:
     """Run one benchmark, aggregate, and write the per-cell JSON.
 
@@ -1101,6 +1159,16 @@ def _run_benchmark(
     # counts back to the right per-row matrix.
     prompts: list[str] = []
     row_keys_per_completion: list[str] = []
+    # Defensive filter: drop prompts whose prefill exceeds the model's
+    # context window (`max_model_len - max_tokens - safety_margin`).
+    # Otherwise vLLM raises `VLLMValidationError` mid-batch and the
+    # whole cell aborts. We keep the row's other (in-bounds) prompts
+    # so the row still appears in the output. This shows up most on
+    # INCLUDE 5-shot (some (lang, dom) groups have long exemplars)
+    # and MMLU 5-shot on long subjects (professional_law etc).
+    safety_margin = 16
+    max_prefill = max_model_len - max_tokens - safety_margin
+    n_dropped = 0
     for row in benchmark.rows:
         # Refresh the row's prefill token count from the vLLM tokenizer
         # (more accurate than a static precompute). vLLM's tokenizer
@@ -1117,7 +1185,25 @@ def _run_benchmark(
         ) or tokenizer_obj
         add_bos = bool(getattr(inner, "add_bos_token", False))
         per_prompt_prefill = _tokenize_prompts(tokenizer_obj, row.prompts, add_bos)
-        row.prefill_tokens = sum(per_prompt_prefill)
+        # Filter out prompts whose prefill exceeds the budget; keep the
+        # in-bounds ones. Updates per-row prefill_tokens to reflect only
+        # the kept prompts.
+        kept_prompts: list[str] = []
+        kept_prefill: list[int] = []
+        for prompt, n_tok in zip(row.prompts, per_prompt_prefill):
+            if n_tok > max_prefill:
+                n_dropped += 1
+                logger.warning(
+                    "  dropping over-budget prompt: row=%r, prefill_tokens=%d, max=%d",
+                    row.key,
+                    n_tok,
+                    max_prefill,
+                )
+                continue
+            kept_prompts.append(prompt)
+            kept_prefill.append(n_tok)
+        row.prompts = kept_prompts
+        row.prefill_tokens = sum(kept_prefill)
         # `generated_tokens` is the model's `max_tokens` cap; the actual
         # generated count comes back from `aggregate_expert_counts`
         # via `RequestOutput.outputs[i].token_ids`. We initialise to 0
@@ -1127,6 +1213,19 @@ def _run_benchmark(
         for p in row.prompts:
             prompts.append(p)
             row_keys_per_completion.append(row.key)
+
+    if n_dropped:
+        logger.warning(
+            "Dropped %d over-budget prompt(s) from benchmark %s "
+            "(prefill > %d = max_model_len=%d - max_tokens=%d - margin=%d); "
+            "rows with zero kept prompts will appear with empty arrays",
+            n_dropped,
+            benchmark.name,
+            max_prefill,
+            max_model_len,
+            max_tokens,
+            safety_margin,
+        )
 
     logger.info(
         "Running benchmark %s: %d row(s), %d prompt(s) total",
@@ -1325,6 +1424,29 @@ def main() -> None:
             tokenizer = llm.get_tokenizer()
 
             for benchmark_name in args.benchmarks:
+                # Idempotency check: if this (model, quant, benchmark)
+                # cell's JSON already exists, skip the workload. The
+                # canonical output path mirrors the sbatch's
+                # `--output-dir` arg. To force a re-run, delete the
+                # JSON before submitting.
+                _cell_out = (
+                    output_dir
+                    / _safe_id(model)
+                    / _safe_id(quant)
+                    / f"moe-{benchmark_name}"
+                    / "expert_counts.json"
+                )
+                if _cell_out.exists():
+                    logger.info(
+                        "Skipping cell: model=%s, quant=%s, benchmark=%s "
+                        "(output already exists at %s; delete to rerun)",
+                        model,
+                        quant or "<none>",
+                        benchmark_name,
+                        _cell_out,
+                    )
+                    continue
+
                 loader = BENCHMARK_LOADERS[benchmark_name]
                 benchmark = loader(
                     num_samples=args.num_samples,
@@ -1344,6 +1466,8 @@ def main() -> None:
                     n_shot=args.n_shots,
                     tokenizer=tokenizer,
                     output_dir=output_dir,
+                    max_model_len=args.max_model_len,
+                    max_tokens=args.max_tokens,
                 )
 
             # Free GPU memory + tear down torch.distributed before the

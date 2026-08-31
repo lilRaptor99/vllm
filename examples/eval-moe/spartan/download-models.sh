@@ -202,10 +202,21 @@ download_one() {
 
     mkdir -p "${CACHE_DIR}"
 
-    # Idempotency: any snapshot dir with config.json means we're done.
-    if compgen -G "${cache_dir}/snapshots/*/config.json" >/dev/null; then
-        echo "[info] ${repo_id}: already cached, skip"
+    # Idempotency: a snapshot is only "complete" if it has BOTH
+    # config.json AND at least one safetensors shard. We previously
+    # only checked config.json, which incorrectly skipped repos
+    # whose weights download had been killed mid-stream (config +
+    # tokenizer land first, then safetensors).
+    if compgen -G "${cache_dir}/snapshots/*/config.json" >/dev/null \
+       && compgen -G "${cache_dir}/snapshots/*/*.safetensors" >/dev/null; then
+        echo "[info] ${repo_id}: already cached (config + safetensors present), skip"
         return 0
+    fi
+    # Partial cache from a prior killed download: wipe it before retrying
+    # so snapshot_download doesn't see partial blobs and refuse.
+    if compgen -G "${cache_dir}/snapshots/*" >/dev/null; then
+        echo "[warn] ${repo_id}: partial cache detected (missing safetensors); wiping and re-downloading"
+        rm -rf "${cache_dir}"
     fi
 
     echo "[info] ${repo_id}: downloading -> ${cache_dir} ..."
