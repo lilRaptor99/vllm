@@ -199,9 +199,13 @@ class BenchmarkPrompts:
         rows: One `BenchmarkRow` per record (subject / task / prop /
               langdom).
         arch_name: A short architecture hint for the model's MoE
-                   block (e.g. "olmoe", "mixtral", "gpt-oss"). Currently
-                   informational only; downstream tools that need a
-                   specific name can re-derive it from the HF config.
+                   block (e.g. "olmoe", "mixtral", "gpt-oss").
+                   **Deprecated as a source of truth** since the vLLM
+                   analyzer's per-cell writer stamps the real value
+                   (from the HF `model_type`) onto `model_arch.name`.
+                   Benchmark loaders still set it (defaulting to
+                   "olmoe" for back-compat) but it's no longer read
+                   by `_write_per_benchmark_json`.
     """
 
     name: str
@@ -874,30 +878,104 @@ def aggregate_expert_counts(
 # ---------------------------------------------------------------------------
 
 
-def _read_model_config(model: str) -> tuple[int, int, int]:
-    """Read num_experts, num_experts_per_tok, num_hidden_layers from HF config.
+def _hf_arch_name(model_type: str | None) -> str:
+    """Map HF `model_type` to the canonical short `model_arch.name`.
+
+    Returns the lowercased model_type (no underscores) when known, else
+    `f"hf:{model_type}"` so the misnaming that motivated adding this
+    function doesn't silently re-emerge as a hardcoded "olmoe".
+    Sister-repo tools (`aggregate_overview.py` etc.) use this string
+    as a *display* label only - the per-cell shape comes from the
+    numeric `n_layer` / `n_expert` / `n_expert_used` fields - so a
+    correct string here fixes heatmap labels and CSV row headers
+    without breaking shape-driven math.
+    """
+    if not model_type:
+        return "unknown"
+    # Canonicalise: "qwen3_moe" -> "qwen3-moe", "gpt_oss" -> "gpt-oss",
+    # "deepseek_moe" -> "deepseek-moe". Keeps the visual contract with
+    # the sister repo's model-naming convention (which uses hyphens).
+    return model_type.replace("_", "-").lower()
+
+
+def _resolve_local_snapshot(model_id: str) -> str | None:
+    """Resolve `model_id` to a local HF snapshot path under $HF_HOME.
+
+    Returns the canonical `snapshots/<rev>/` path if a snapshot exists
+    on disk, else None. Accepts both HF cache layouts the project uses:
+
+      (a) ${HF_HOME}/models--<org>--<name>/snapshots/<rev>/          (root-level, default under HUGGINGFACE_HUB_CACHE=${HF_HOME})
+      (b) ${HF_HOME}/hub/models--<org>--<name>/snapshots/<rev>/      (default HF_HUB layout, pre-existing snapshots land here when HUGGINGFACE_HUB_CACHE is unset)
+
+    Why this exists: with `HUGGINGFACE_HUB_CACHE=${HF_HOME}` (set by the
+    sbatch), `huggingface_hub.cached_file` only looks under (a).
+    Pre-existing snapshots downloaded under the default layout land at
+    (b), and vLLM's engine has its own offline-mode rewrite that finds
+    them, but `transformers.AutoConfig.from_pretrained` does not - so
+    the analyzer crashed mid-preflight on Qwen3 (job 31273232, Sep 25
+    2026) with `LocalEntryNotFoundError` even though the snapshot was
+    fully on disk under (b). Resolving to the snapshot path explicitly
+    bypasses HF Hub's repo-id-to-path logic and lets AutoConfig read
+    the config.json + tokenizer files directly.
+    """
+    if "/" not in model_id:
+        return None
+    org, name = model_id.split("/", 1)
+    safe = f"models--{org}--{name}"
+    hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    # (a) root-level: default when HUGGINGFACE_HUB_CACHE=${HF_HOME}
+    # (b) hub/-nested: default HF Hub layout (and where pre-existing
+    #     snapshots land if HUGGINGFACE_HUB_CACHE was unset when they
+    #     were downloaded)
+    for layout in (hf_home, os.path.join(hf_home, "hub")):
+        snapshots = os.path.join(layout, safe, "snapshots")
+        if os.path.isdir(snapshots):
+            revisions = sorted(
+                d for d in os.listdir(snapshots)
+                if os.path.isdir(os.path.join(snapshots, d))
+            )
+            if revisions:
+                # HF Hub picks the highest-priority revision; the only
+                # one present here is the one we downloaded, so any is fine.
+                return os.path.join(snapshots, revisions[0])
+    return None
+
+
+def _read_model_config(model: str) -> tuple[int, int, int, str]:
+    """Read num_experts, num_experts_per_tok, num_hidden_layers, model_type.
 
     `trust_remote_code=True` is required for architectures like DeepSeek-MoE
     that ship custom modeling code on the Hub. Without it, AutoConfig raises
-    on a non-interactive stdin (SLURM jobs have no TTY), so the prompt for
-    trust confirmation EOFs before the user can answer.
+    on the remote-code sentinel.
 
-    Different MoE architectures name these fields differently:
+    Returns (num_experts, num_experts_per_tok, num_hidden_layers) where the
+    names are aliases across architectures:
       - OLMoE / gpt-oss : num_experts
       - Mixtral         : num_local_experts
       - DeepSeek-MoE    : n_routed_experts (plus n_shared_experts, but those
-                          are NOT in vLLM's routed_experts tensor — they're
+                          are NOT in vLLM's routed_experts tensor - they're
                           always-on experts, not part of the routing pool)
 
-    The values are used downstream as the bincount minlength / matrix shape
-    in `aggregate_expert_counts`, so they must match the cardinality of the
-    IDs that vLLM actually emits in `routed_experts` for that architecture.
+    The numeric values are used downstream as the bincount minlength /
+    matrix shape in `aggregate_expert_counts`, so they must match the
+    cardinality of the IDs that vLLM actually emits in `routed_experts`
+    for that architecture. `model_type` is returned so the writer can
+    stamp the correct `model_arch.name` (was previously hardcoded to
+    "olmoe" by every benchmark loader, which made Qwen3/Mixtral/
+    DeepSeek/gpt-oss all appear as "olmoe" in cross-arch views).
     """
     from transformers import AutoConfig  # type: ignore[import-untyped]
 
+    # Resolve to a local snapshot path so AutoConfig doesn't try to hit
+    # the HF Hub API (offline mode + firewalled compute nodes would
+    # raise LocalEntryNotFoundError). See `_resolve_local_snapshot`
+    # for why this is needed.
+    local_path = _resolve_local_snapshot(model)
+    resolved = local_path if local_path else model
+
     hf_config: Any = cast(
         Any,
-        AutoConfig.from_pretrained(model, trust_remote_code=True),  # type: ignore[no-untyped-def]
+        AutoConfig.from_pretrained(resolved, trust_remote_code=True),  # type: ignore[no-untyped-def]
     )
 
     def _resolve(candidates: list[str]) -> int:
@@ -919,7 +997,8 @@ def _read_model_config(model: str) -> tuple[int, int, int]:
     num_experts = _resolve(["n_routed_experts", "num_experts", "num_local_experts"])
     num_experts_per_tok = _resolve(["num_experts_per_tok", "top_k"])
     num_hidden_layers = _resolve(["num_hidden_layers", "n_layer", "num_layers"])
-    return num_experts, num_experts_per_tok, num_hidden_layers
+    model_type = str(getattr(hf_config, "model_type", "") or "") or "unknown"
+    return num_experts, num_experts_per_tok, num_hidden_layers, model_type
 
 
 def _safe_id(name: str, fallback: str = "default") -> str:
@@ -950,6 +1029,7 @@ def _build_llm(
     enforce_eager: bool,
     seed: int,
     tensor_parallel_size: int = 1,
+    hf_overrides: dict[str, Any] | None = None,
 ) -> Any:
     """Instantiate a fresh vLLM `LLM` for one (model, quant) cell.
 
@@ -982,6 +1062,8 @@ def _build_llm(
     }
     if quant:
         kwargs["quantization"] = quant
+    if hf_overrides:
+        kwargs["hf_overrides"] = hf_overrides
     return LLM(**kwargs)
 
 
@@ -1146,6 +1228,7 @@ def _run_benchmark(
     output_dir: Path,
     max_model_len: int,
     max_tokens: int,
+    arch_name: str,
 ) -> None:
     """Run one benchmark, aggregate, and write the per-cell JSON.
 
@@ -1263,7 +1346,7 @@ def _run_benchmark(
     _write_per_benchmark_json(
         out_path=out_path,
         model=model,
-        arch_name=benchmark.arch_name,
+        arch_name=arch_name,
         quant=quant,
         benchmark=benchmark,
         num_layers=num_layers,
@@ -1364,6 +1447,16 @@ def _parse_args() -> argparse.Namespace:
             "sbatch to use the full GPU allocation."
         ),
     )
+    parser.add_argument(
+        "--hf-overrides",
+        default=None,
+        help=(
+            "JSON string forwarded as `LLM(..., hf_overrides=...)`. "
+            "Lets us inject synthetic HF config fields (e.g. "
+            "`compression_config` for compressed-tensors W4A8) "
+            "without modifying the model's config.json on scratch."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1396,15 +1489,24 @@ def main() -> None:
             cell_label = f"model={model}, quant={quant or '<none>'}"
             logger.info("=== cell: %s ===", cell_label)
 
-            num_experts, num_experts_per_tok, num_hidden_layers = _read_model_config(
-                model
+            num_experts, num_experts_per_tok, num_hidden_layers, hf_model_type = (
+                _read_model_config(model)
             )
+            # Stamp the actual architecture name. The benchmark loaders
+            # hardcode "olmoe" for `BenchmarkPrompts.arch_name`, but
+            # `model_arch.name` should reflect the real HF model_type so
+            # cross-arch views (sister-repo aggregator, Jaccard print
+            # headers) don't mislabel Qwen3 / Mixtral / DeepSeek / gpt-oss
+            # all as "olmoe".
+            effective_arch_name = _hf_arch_name(hf_model_type)
             logger.info(
                 "Model config: num_experts=%d, num_experts_per_tok=%d, "
-                "num_hidden_layers=%d",
+                "num_hidden_layers=%d, model_type=%s (-> arch_name=%s)",
                 num_experts,
                 num_experts_per_tok,
                 num_hidden_layers,
+                hf_model_type,
+                effective_arch_name,
             )
 
             llm = _build_llm(
@@ -1416,6 +1518,10 @@ def main() -> None:
                 enforce_eager=args.enforce_eager,
                 seed=args.seed,
                 tensor_parallel_size=args.tensor_parallel_size,
+                hf_overrides=(
+                    json.loads(args.hf_overrides)
+                    if args.hf_overrides else None
+                ),
             )
 
             # Tokenizer for per-prompt prefill counts (so the
@@ -1468,6 +1574,7 @@ def main() -> None:
                     output_dir=output_dir,
                     max_model_len=args.max_model_len,
                     max_tokens=args.max_tokens,
+                    arch_name=effective_arch_name,
                 )
 
             # Free GPU memory + tear down torch.distributed before the

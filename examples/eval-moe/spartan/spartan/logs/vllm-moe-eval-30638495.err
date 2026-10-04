@@ -1,0 +1,161 @@
+The following modules were not unloaded:
+  (Use "module --force purge" to unload all):
+
+  1) slurm/default   2) spartan/rhel9
+
+Currently Loaded Modules:
+  1) slurm/default  (S)   6) ncurses/6.4      11) XZ/5.2.5
+  2) spartan/rhel9  (S)   7) libreadline/8.2  12) libffi/3.4.4
+  3) GCCcore/11.3.0       8) zlib/1.2.13      13) OpenSSL/1.1
+  4) binutils/2.38        9) Tcl/8.6.13       14) Python/3.11.3
+  5) bzip2/1.0.8         10) SQLite/3.42.0    15) CUDA/12.4.1
+
+  Where:
+   S:  Module is Sticky, requires --force to unload or purge
+
+ 
+
+[warn] BENCHMARKS contains unknown dataset 'popqa'; analyzer will refuse
+[warn] BENCHMARKS contains unknown dataset 'include'; analyzer will refuse
+INFO:__main__:Eval plan: 1 model(s) x 1 quant(s) = 1 cell(s); benchmarks=['mmlu', 'bbh', 'humaneval', 'popqa', 'include']
+INFO:__main__:=== cell: model=mistralai/Mixtral-8x22B-Instruct-v0.1, quant=<none> ===
+INFO:__main__:Model config: num_experts=8, num_experts_per_tok=2, num_hidden_layers=56, model_type=mixtral (-> arch_name=mixtral)
+<frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=60444) <frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=60444) <frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=60443) <frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=60443) <frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=60445) <frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=60445) <frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=60446) <frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=60446) <frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:   0% Completed | 0/59 [00:00<?, ?it/s]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:   2% Completed | 1/59 [00:01<01:30,  1.55s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:   3% Completed | 2/59 [00:03<01:28,  1.56s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:   5% Completed | 3/59 [00:04<01:27,  1.57s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:   7% Completed | 4/59 [00:06<01:28,  1.60s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:   8% Completed | 5/59 [00:08<01:27,  1.62s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  10% Completed | 6/59 [00:09<01:24,  1.60s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  12% Completed | 7/59 [00:11<01:24,  1.63s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  14% Completed | 8/59 [00:12<01:22,  1.63s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  15% Completed | 9/59 [00:14<01:21,  1.63s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  17% Completed | 10/59 [00:16<01:20,  1.64s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  19% Completed | 11/59 [00:17<01:18,  1.63s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  20% Completed | 12/59 [00:19<01:17,  1.64s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  22% Completed | 13/59 [00:21<01:15,  1.64s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  24% Completed | 14/59 [00:22<01:14,  1.66s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  25% Completed | 15/59 [00:24<01:12,  1.65s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  27% Completed | 16/59 [00:25<01:09,  1.62s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  29% Completed | 17/59 [00:27<01:07,  1.60s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  31% Completed | 18/59 [00:29<01:04,  1.58s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  32% Completed | 19/59 [00:30<01:02,  1.57s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  34% Completed | 20/59 [00:32<01:01,  1.57s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  36% Completed | 21/59 [00:33<00:59,  1.57s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  37% Completed | 22/59 [00:35<00:57,  1.57s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  39% Completed | 23/59 [00:36<00:55,  1.54s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  41% Completed | 24/59 [00:38<00:53,  1.54s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  42% Completed | 25/59 [00:39<00:52,  1.53s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  44% Completed | 26/59 [00:41<00:50,  1.52s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  46% Completed | 27/59 [00:42<00:48,  1.51s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  47% Completed | 28/59 [00:44<00:46,  1.49s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  49% Completed | 29/59 [00:45<00:44,  1.49s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  51% Completed | 30/59 [00:47<00:42,  1.47s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  53% Completed | 31/59 [00:48<00:41,  1.47s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  54% Completed | 32/59 [00:50<00:39,  1.47s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  56% Completed | 33/59 [00:51<00:37,  1.45s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  58% Completed | 34/59 [00:53<00:37,  1.51s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  59% Completed | 35/59 [00:54<00:35,  1.48s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  61% Completed | 36/59 [00:56<00:33,  1.47s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  63% Completed | 37/59 [00:57<00:31,  1.44s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  64% Completed | 38/59 [00:58<00:30,  1.43s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  66% Completed | 39/59 [01:00<00:28,  1.44s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  68% Completed | 40/59 [01:01<00:27,  1.46s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  69% Completed | 41/59 [01:03<00:25,  1.44s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  71% Completed | 42/59 [01:04<00:24,  1.45s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  73% Completed | 43/59 [01:06<00:23,  1.44s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  75% Completed | 44/59 [01:07<00:21,  1.42s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  76% Completed | 45/59 [01:08<00:19,  1.42s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  78% Completed | 46/59 [01:10<00:18,  1.41s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  80% Completed | 47/59 [01:11<00:17,  1.42s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  81% Completed | 48/59 [01:13<00:15,  1.42s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  83% Completed | 49/59 [01:14<00:14,  1.43s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  85% Completed | 50/59 [01:16<00:12,  1.44s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  86% Completed | 51/59 [01:17<00:11,  1.47s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  88% Completed | 52/59 [01:19<00:10,  1.52s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  90% Completed | 53/59 [01:20<00:09,  1.54s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  92% Completed | 54/59 [01:22<00:07,  1.55s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  93% Completed | 55/59 [01:23<00:06,  1.55s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  95% Completed | 56/59 [01:25<00:04,  1.55s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  97% Completed | 57/59 [01:26<00:03,  1.53s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards:  98% Completed | 58/59 [01:28<00:01,  1.52s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards: 100% Completed | 59/59 [01:28<00:00,  1.20s/it]
+(Worker_TP0 pid=60443) Loading safetensors checkpoint shards: 100% Completed | 59/59 [01:28<00:00,  1.51s/it]
+(Worker_TP0 pid=60443) 
+(EngineCore pid=60185) Process EngineCore:
+(EngineCore pid=60185) Traceback (most recent call last):
+(EngineCore pid=60185)   File "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/Python/3.11.3/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore pid=60185)     self.run()
+(EngineCore pid=60185)   File "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/Python/3.11.3/lib/python3.11/multiprocessing/process.py", line 108, in run
+(EngineCore pid=60185)     self._target(*self._args, **self._kwargs)
+(EngineCore pid=60185)   File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/core.py", line 1358, in run_engine_core
+(EngineCore pid=60185)     raise e
+(EngineCore pid=60185)   File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/core.py", line 1316, in run_engine_core
+(EngineCore pid=60185)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=60185)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=60185)   File "/data/gpfs/projects/uom00014/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=60185)     return func(*args, **kwargs)
+(EngineCore pid=60185)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=60185)   File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/core.py", line 1073, in __init__
+(EngineCore pid=60185)     super().__init__(
+(EngineCore pid=60185)   File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/core.py", line 144, in __init__
+(EngineCore pid=60185)     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore pid=60185)                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=60185)   File "/data/gpfs/projects/uom00014/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=60185)     return func(*args, **kwargs)
+(EngineCore pid=60185)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=60185)   File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/core.py", line 307, in _initialize_kv_caches
+(EngineCore pid=60185)     kv_cache_configs = get_kv_cache_configs(
+(EngineCore pid=60185)                        ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=60185)   File "/data/gpfs/projects/uom00014/vllm/vllm/v1/core/kv_cache_utils.py", line 2255, in get_kv_cache_configs
+(EngineCore pid=60185)     _check_enough_kv_cache_memory(
+(EngineCore pid=60185)   File "/data/gpfs/projects/uom00014/vllm/vllm/v1/core/kv_cache_utils.py", line 779, in _check_enough_kv_cache_memory
+(EngineCore pid=60185)     raise ValueError(
+(EngineCore pid=60185) ValueError: No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine (this flag also controls CPU memory reservation on the CPU backend, despite its name). See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.
+Traceback (most recent call last):
+  File "/data/gpfs/projects/uom00014/vllm/examples/eval-moe/moe_expert_stats.py", line 1533, in <module>
+    main()
+  File "/data/gpfs/projects/uom00014/vllm/examples/eval-moe/moe_expert_stats.py", line 1449, in main
+    llm = _build_llm(
+          ^^^^^^^^^^^
+  File "/data/gpfs/projects/uom00014/vllm/examples/eval-moe/moe_expert_stats.py", line 1014, in _build_llm
+    return LLM(**kwargs)
+           ^^^^^^^^^^^^^
+  File "/data/gpfs/projects/uom00014/vllm/vllm/entrypoints/llm.py", line 343, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/llm_engine.py", line 179, in from_engine_args
+    return cls(
+           ^^^^
+  File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/llm_engine.py", line 105, in __init__
+    self.engine_core = EngineCoreClient.make_client(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/core_client.py", line 110, in make_client
+    return SyncMPClient(vllm_config, executor_class, log_stats)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/gpfs/projects/uom00014/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/core_client.py", line 813, in __init__
+    super().__init__(
+  File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/core_client.py", line 609, in __init__
+    with launch_core_engines(
+  File "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/Python/3.11.3/lib/python3.11/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/utils.py", line 1240, in launch_core_engines
+    wait_for_engine_startup(
+  File "/data/gpfs/projects/uom00014/vllm/vllm/v1/engine/utils.py", line 1320, in wait_for_engine_startup
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/Python/3.11.3/lib/python3.11/multiprocessing/resource_tracker.py:224: UserWarning: resource_tracker: There appear to be 4 leaked shared_memory objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
