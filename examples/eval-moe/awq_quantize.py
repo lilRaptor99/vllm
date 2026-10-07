@@ -131,6 +131,16 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.awq import AWQMapping, AWQModifier
 from llmcompressor.utils import load_context
 
+# Imported here (instead of at module top) so the file is syntactically
+# import-clean for the repo's analyzer venv which lacks compressed_tensors.
+# build_recipe() runs only inside venv_awq which has it.
+from compressed_tensors.quantization import QuantizationScheme
+from compressed_tensors.quantization.quant_args import (
+    QuantizationArgs,
+    QuantizationStrategy,
+    QuantizationType,
+)
+
 
 RECIPES = ("awq", "gptq", "awq_gptq")
 
@@ -150,21 +160,35 @@ def build_recipe(recipe: str, model_id: str = "") -> list:
     int4 quantization).
 
     DeepSeek-MoE-16B's per-expert `mlp.down_proj` weight has 10944 columns,
-    which is not divisible by 128 (10944 / 128 = 85.5). llm-compressor
-    hard-fails on this in `validate_group_size_divisibility`, AND the
-    bypass flag (which IS valid on GPTQModifier/QuantizationModifier via
-    QuantizationMixin) is a *validation* bypass only — the actual tensor
-    reshape at calibration time (`unflatten(-1, (-1, 128))`) still
-    re-raises a RuntimeError when 10944 % 128 != 0. So for DeepSeek we
-    add `mlp.down_proj` to the `ignore` list (leaving that projection in
-    bf16) AND for the AWQ path we provide explicit `mappings=` that omit
-    the up_proj -> down_proj scaling pair, because AWQ's `_compute_layer_means`
-    would otherwise divide by zero on an empty down_proj set (job
-    32266239 2026-10-05 15:43). OLMoE/Qwen3/Mixtral all have columns %
-    128 == 0 (16384, 768, 1024 respectively) so they need no special
-    handling. GPTQ also gets `dampening_frac=0.02` (default 0.01) for
-    DeepSeek to reduce the 14.2% Hessian-inversion fallback rate that
-    was seen on 32266240.
+    which is NOT divisible by 128 (10944 / 128 = 85.5). The W4A16 preset's
+    group_size=128 would (a) fail llm-compressor's divisibility validation
+    AND (b) fail the runtime reshape `unflatten(-1, (86, 128))` which expects
+    11008 cols not 10944. vLLM's CompressedTensorsMoEMethod further requires
+    that all 3 MoE projections (gate, up, down) within a single FusedMoE
+    share a quantization scheme, so leaving down_proj in bf16 (the prior
+    approach via `ignore=["re:.*\\.down_proj$"]`) causes a load-time
+    `ValueError: All MoE projections need to have same quantization scheme`
+    in vLLM 0.1.dev20195+gf7160722f (job 32345449 2026-10-06).
+
+    Fix: quantize DeepSeek at group_size=64 (10944 % 64 == 0 exactly,
+    so no reshape error, no padding waste). This is a standard WNA16
+    Marlin-supported group size ({32, 64, 128}). The compression ratio
+    drop is tiny in absolute terms because the extra scale bytes per
+    row are dwarfed by the per-token int4 data bytes. Per-expert
+    down_proj goes from bf16 4096x10944 = 86 MB to int4 group=64 =
+    ~5.6 MB (same 15x compression as group=128).
+
+    For AWQ we restore the full `mappings=[...]` including the
+    up_proj -> down_proj pair (now that down_proj is in the quant set,
+    AWQ's `_compute_layer_means` won't divide by zero). The previous
+    "no down_proj mapping" hack is no longer needed. We still pass
+    `dampening_frac=0.02` for GPTQ to reduce the 14.2% Hessian
+    inversion failure rate on this branch of the Hessian's structure
+    (job 32266240 2026-10-05).
+
+    OLMoE/Qwen3/Mixtral all have down_proj columns % 128 == 0 (16384,
+    768, 1024 respectively) so they keep the W4A16 preset (group_size=128)
+    and the standard AWQ mapping registry.
     """
     ignore = [
         "lm_head",
@@ -172,52 +196,104 @@ def build_recipe(recipe: str, model_id: str = "") -> list:
         "re:.*mlp\\.shared_expert_gate$",
     ]
     is_deepseek = "deepseek" in (model_id or "").lower()
+
+    # DeepSeek-specific scheme: int4 weights, group_size=64 (not 128) so
+    # the 10944-col down_proj divides evenly. Built inline via config_groups
+    # because the "W4A16" preset hardcodes group_size=128 and the `scheme=`
+    # validator only accepts preset-name keys or whole-scheme dicts.
+    from compressed_tensors.quantization import QuantizationScheme
+    from compressed_tensors.quantization.quant_args import (
+        QuantizationArgs,
+        QuantizationStrategy,
+        QuantizationType,
+    )
+
+    deepseek_weights_args = QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.GROUP,
+        group_size=64,
+        symmetric=True,
+        dynamic=False,
+    )
+    deepseek_config_groups = {
+        "group_0": QuantizationScheme(
+            targets=["Linear"],
+            weights=deepseek_weights_args,
+        ),
+    }
+
     if is_deepseek:
-        # DeepSeek-MoE per-expert mlp.down_proj is [?, 10944], not
-        # divisible by 128. Skip it (stays bf16). See docstring.
-        ignore = ignore + ["re:.*\\.down_proj$"]
-    # DeepSeek: explicit AWQ mappings omitting the up_proj -> down_proj
-    # pair (which would otherwise ZeroDivisionError at _compute_layer_means
-    # because down_proj is in the quant ignore list).
-    deepseek_awq_mappings = [
-        AWQMapping(
-            smooth_layer="re:.*input_layernorm$",
-            balance_layers=["re:.*q_proj$", "re:.*k_proj$", "re:.*v_proj$"],
-        ),
-        AWQMapping(
-            smooth_layer="re:.*v_proj$",
-            balance_layers=["re:.*o_proj$"],
-        ),
-        AWQMapping(
-            smooth_layer="re:.*post_attention_layernorm$",
-            balance_layers=["re:.*gate_proj$", "re:.*up_proj$"],
-        ),
-        # NOTE: no up_proj -> down_proj mapping for DeepSeek.
-    ]
+        # Full DeepSeek AWQ mappings — down_proj is now in the quant set
+        # (since ignore no longer skips it), so include the up_proj ->
+        # down_proj scaling pair.
+        deepseek_awq_mappings = [
+            AWQMapping(
+                smooth_layer="re:.*input_layernorm$",
+                balance_layers=["re:.*q_proj$", "re:.*k_proj$", "re:.*v_proj$"],
+            ),
+            AWQMapping(
+                smooth_layer="re:.*v_proj$",
+                balance_layers=["re:.*o_proj$"],
+            ),
+            AWQMapping(
+                smooth_layer="re:.*post_attention_layernorm$",
+                balance_layers=["re:.*gate_proj$", "re:.*up_proj$"],
+            ),
+            AWQMapping(
+                smooth_layer="re:.*up_proj$",
+                balance_layers=["re:.*down_proj$"],
+            ),
+        ]
+    else:
+        deepseek_awq_mappings = None  # not used; AWQModifier picks its own
+
     if recipe == "awq":
         awq = (
             AWQModifier(mappings=deepseek_awq_mappings, duo_scaling="both", n_grid=10)
             if is_deepseek
             else AWQModifier(duo_scaling="both", n_grid=10)
         )
+        if is_deepseek:
+            return [
+                awq,
+                QuantizationModifier(
+                    config_groups=deepseek_config_groups,
+                    ignore=ignore,
+                ),
+            ]
         return [
             awq,
             QuantizationModifier(targets="Linear", scheme="W4A16", ignore=ignore),
         ]
     if recipe == "gptq":
-        gptq_kwargs = {"targets": "Linear", "scheme": "W4A16", "ignore": ignore}
         if is_deepseek:
-            gptq_kwargs["dampening_frac"] = 0.02
-        return [GPTQModifier(**gptq_kwargs)]
+            return [
+                GPTQModifier(
+                    config_groups=deepseek_config_groups,
+                    ignore=ignore,
+                    dampening_frac=0.02,
+                ),
+            ]
+        return [
+            GPTQModifier(targets="Linear", scheme="W4A16", ignore=ignore),
+        ]
     if recipe == "awq_gptq":
         awq = (
             AWQModifier(mappings=deepseek_awq_mappings, duo_scaling="both", n_grid=10)
             if is_deepseek
             else AWQModifier(duo_scaling="both", n_grid=10)
         )
-        gptq_kwargs = {"targets": "Linear", "scheme": "W4A16", "ignore": ignore}
         if is_deepseek:
-            gptq_kwargs["dampening_frac"] = 0.02
+            return [
+                awq,
+                GPTQModifier(
+                    config_groups=deepseek_config_groups,
+                    ignore=ignore,
+                    dampening_frac=0.02,
+                ),
+            ]
+        gptq_kwargs = {"targets": "Linear", "scheme": "W4A16", "ignore": ignore}
         return [
             awq,
             GPTQModifier(**gptq_kwargs),
