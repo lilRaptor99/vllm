@@ -1195,3 +1195,115 @@ at the end where they only consume time, not productive wall.
 
 - **Output tree**: same as before, `results_wide_w4a16_awq_h100/`.
   Idempotent skip means OLMoE's 10 existing JSONs are preserved.
+
+
+---
+
+## ADDENDUM 5 (added Oct 8, 2026 — DeepSeek re-prequant with group_size=64, w8a16 upload, Mixtral TP=4 sweep)
+
+This addendum covers four separate pieces of work that landed between the
+Oct 6 handoff and now:
+
+### W. w8a16_h100 → MediaFlux upload (Oct 8 morning)
+
+Uploaded `results_wide_w8a16_h100/` (20 expert_counts.json, 13.58 GB)
+to `/projects/proj-4180_momqe_data-1128.4.2052/results_wide_w8a16_h100/`
+via `bash ~/.hermes/scripts/upload-eval-moe-results.sh results_wide_w8a16_h100`.
+20/20 files, 0 failures, ~1.5 GB/s sustained. Local scratch copy preserved
+(user decision — 372 GB free on scratch, keeping the local copy avoids
+re-pull from MediaFlux if alignment is questioned later). Closes the
+handoff §7 #2 open item.
+
+### X. DeepSeek re-prequant — root-cause fix for the bf16/int4 mismatch
+
+**Problem confirmed in job 32430109** (Oct 8 04:30, 1h11m wall,
+COMPLETED exit 0 — the per-cell try/except saved the sweep). DeepSeek
+× 2 cells failed with the documented ValueError, OLMoE + Qwen3 each
+contributed 10 new expert_counts.json (20/40 cells now on scratch).
+Mixtral × 2 also failed: "Available KV cache memory: -1.77 GiB" at
+TP=1 with the 68 GB W4A16 ckpt loaded → no headroom for KV cache at
+`gpu_mem_util=0.92`.
+
+**The fix for DeepSeek** (commit `c016fe05`, file `examples/eval-moe/awq_quantize.py`):
+
+1. Use **group_size=64** instead of the W4A16 preset's 128. DeepSeek's
+   per-expert `mlp.down_proj` has 10944 cols; 10944 % 128 = 80 (fails
+   divisibility check + runtime reshape `unflatten(-1, (86, 128))`
+   fails with "Provided sizes [86, 128] don't multiply up to the size
+   of dim 1 (10944)"). 10944 % 64 = 0 → no padding, no reshape error.
+   64 is a standard WNA16 Marlin-supported size (group_size ∈ {32, 64, 128}).
+
+2. **Drop the `re:.*\.down_proj$` ignore** (the old workaround that
+   left down_proj at bf16). vLLM's `CompressedTensorsMoEMethod.get_moe_method`
+   rejects a single FusedMoE with mixed schemes across gate/up/down.
+
+3. **Restore the full AWQ `mappings=[...]` list** including the
+   `up_proj → down_proj` scaling pair (previously omitted to dodge a
+   ZeroDivisionError on the empty down_proj set in
+   `_compute_layer_means`; no longer needed now that down_proj is in
+   the quant set).
+
+4. Build the scheme inline via `config_groups={"group_0": QuantizationScheme(...)}`
+   with `QuantizationArgs(num_bits=4, type=INT, strategy=GROUP,
+   group_size=64, symmetric=True, dynamic=False)`. The `scheme="W4A16"`
+   preset hardcodes group_size=128 and the validator only accepts
+   preset-name keys in `scheme=`.
+
+5. GPTQ keeps `dampening_frac=0.02` (default 0.01) for DeepSeek to
+   reduce the 14.2% Hessian-inversion fallback rate seen on job
+   32266240. Qwen3/OLMoE/Mixtral paths are unchanged (their down_proj
+   cols % 128 == 0, so they keep the W4A16 preset).
+
+**Validation helper**: `examples/eval-moe/scripts/validate_deepseek_prequant.py`
+(commit `9f4191b0`). 30s GPU smoke test that:
+- Builds AWQ + GPTQ recipes without exception
+- Confirms group_size=64 (not 128)
+- Confirms `ignore` does NOT contain down_proj
+- Initializes the modifiers on a synthetic `torch.nn.Linear(4096, 10944)`
+  layer to exercise the divisibility validator (`validate_group_size_divisibility`)
+  without needing the actual model.
+
+Run on an interactive H100 BEFORE the full sbatch submission to catch
+recipe regressions early.
+
+**Re-prequant sbatches** submitted Oct 8 09:35 (gpu-h100, 4h wall each):
+- `32518557` DeepSeek AWQ — start 2026-10-08 15:24 (today)
+- `32518558` DeepSeek GPTQ — start 2026-10-08 19:30 (today)
+- `32517565` Mixtral W4A16 TP=4 — start 2026-10-16 13:30 (8 days out)
+
+SLURM backfilled the short DeepSeek jobs (~10 min wall each) ahead of
+the 4-h-TW Mixtral sweep. Old mixed-precision DeepSeek ckpts deleted
+from `${SCRATCH}/hf_cache_awq/` to make room for the new runs.
+
+### Y. Mixtral W4A16 analyzer — re-submitted at TP=4
+
+Job `32517565` is the re-submission of the failed TP=1 Mixtral cells
+in 32430109. Same `vllm-moe-eval-h100-w4a16-prequant.sbatch` with:
+- `MODELS_OVERRIDE` pinned to the two Mixtral prequant dirs
+- `NGPUS=4`, `EXTRA_TENSOR_SPLIT=25,25,25,25`
+- `OUTPUT_DIR=results_wide_w4a16_awq_h100`
+- 12h wall
+
+Per-GPU W4A16 Mixtral weight ~17 GB → ample KV cache headroom on 80 GB
+H100, matching the bf16/w8a16 precedent from `vllm-moe-eval-h100-w8a16-mixtral-tp4.sbatch`
+(job 31516295, the only prior Mixtral success).
+
+### Z. Updated open items (Oct 8)
+
+1. **DeepSeek re-prequant** — jobs 32518557 (AWQ) + 32518558 (GPTQ)
+   will run today. After they land:
+   - Run `validate_deepseek_prequant.py` end-to-end (replace the
+     dry-run `4096x10944` check with actual `AutoConfig.from_pretrained`
+     on the saved ckpt)
+   - Submit a fresh W4A16 analyzer cell for DeepSeek × 2. With the
+     new ckpts, vLLM's `get_moe_method` should accept the same-scheme
+     invariant and the cell should produce 10 expert_counts.json.
+   - Once DeepSeek × 2 cells work, the W4A16 sweep total jumps from
+     30 to 40 expert_counts.json.
+2. **MediaFlux upload of w8a16_h100** — **DONE** (Oct 8 morning).
+   Closes §7 #2.
+3. **Optional**: AWQ+GPTQ combined for OLMoE/DeepSeek/Qwen3 (3 more
+   prequant jobs, ~10 min each — user explicitly deferred).
+4. **Optional**: re-prequant DeepSeek with `awq_gptq` recipe too —
+   just adds 1 more cell. Probably skip.
+5. **Cross-archive Jaccard sweep** in sister repo after #1 lands.
