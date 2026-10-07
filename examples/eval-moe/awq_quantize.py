@@ -46,17 +46,96 @@ if not hasattr(_iu, "is_torch_fx_available"):
 if not hasattr(_iu, "is_torch_greater_or_equal_than_1_13"):
     _iu.is_torch_greater_or_equal_than_1_13 = lambda *a, **k: True  # type: ignore[attr-defined]
 
+# llmcompressor.entrypoints.oneshot.Oneshot.validate_model (oneshot.py:292)
+# does its own `AutoConfig.from_pretrained(...)` on the model without
+# forwarding `trust_remote_code=True`. For DeepSeek-MoE (which ships custom
+# modeling code) this triggers a fresh interactive prompt and dies with
+# `ValueError: ... must pass trust_remote_code=True` under SLURM (no TTY).
+# Force the resolver to always return True.
+#
+# IMPORTANT: every call site does
+#   from ...dynamic_module_utils import resolve_trust_remote_code
+# which creates a *local* binding in the consumer module. Just reassigning
+# the attribute on dynamic_module_utils leaves those local bindings
+# pointing at the original function (the failure mode we hit on jobs
+# 32236909/32236910 with the v1 shim). Walk sys.modules and overwrite the
+# local binding in any already-loaded transformers module that has it, so
+# the patched function is what gets called.
+import sys
+import transformers.dynamic_module_utils as _dmu
+import transformers.models.auto.configuration_auto as _ca
+import transformers.models.auto.auto_factory as _af
+import transformers.models.auto.tokenization_auto as _ta
+import transformers.models.auto.image_processing_auto as _ia
+import transformers.models.auto.video_processing_auto as _va
+import transformers.models.auto.feature_extraction_auto as _fea
+import transformers.models.auto.processing_auto as _pa
+
+
+def _force_trust_remote_code(*_a, **_k):
+    return True
+
+
+_dmu.resolve_trust_remote_code = _force_trust_remote_code  # type: ignore[assignment]
+for _mod in (
+    _ca,
+    _af,
+    _ta,
+    _ia,
+    _va,
+    _fea,
+    _pa,
+    sys.modules.get("transformers.generation.utils"),
+):
+    if _mod is not None and hasattr(_mod, "resolve_trust_remote_code"):
+        _mod.resolve_trust_remote_code = _force_trust_remote_code  # type: ignore[attr-defined]
+del _mod, _ca, _af, _ta, _ia, _va, _fea, _pa
+
+# DeepseekPreTrainedModel declares `_tied_weights_keys = ["lm_head.weight"]`
+# (a list) in modeling_deepseek.py:1267. transformers v5.15.1's
+# `_get_tied_weight_keys` (modeling_utils.py:381) expects a dict and
+# calls `tied.keys()` — AttributeError on a list. The lm_head in the
+# saved DeepSeek-MoE safetensors is *not* tied to embeddings (separate
+# tensor), so clearing the tied-weights claim is correct for this
+# checkpoint. Wrap the function to coerce lists to empty dicts (and
+# dicts-without-tensor-mapping to empty dicts) so the iteration works
+# for any old-style custom modeling code.
+import transformers.modeling_utils as _mu
+_orig_get_tied = _mu._get_tied_weight_keys
+
+
+def _patched_get_tied_weight_keys(module):
+    out = []
+    for name, sub in module.named_modules():
+        tied = getattr(sub, "_tied_weights_keys", None)
+        if tied is None:
+            continue
+        if isinstance(tied, list):
+            # Old API: a list of key names that are tied to the previous
+            # one. v5 can't model that generically — just drop them all
+            # so the iteration below is empty. Safe for DeepSeek because
+            # the saved checkpoint stores lm_head as its own tensor.
+            continue
+        if not isinstance(tied, dict):
+            continue
+        out.extend([f"{name}.{k}" if name else k for k in tied.keys()])
+    return out
+
+
+_mu._get_tied_weight_keys = _patched_get_tied_weight_keys
+del _orig_get_tied
+
 from llmcompressor import oneshot
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.awq import AWQModifier
+from llmcompressor.modifiers.transform.awq import AWQMapping, AWQModifier
 from llmcompressor.utils import load_context
 
 
 RECIPES = ("awq", "gptq", "awq_gptq")
 
 
-def build_recipe(recipe: str) -> list:
+def build_recipe(recipe: str, model_id: str = "") -> list:
     """Return the recipe list for the requested int4 quantization strategy.
 
     All three target W4A16 with group_size 128 and skip lm_head + MoE
@@ -69,25 +148,79 @@ def build_recipe(recipe: str) -> list:
     QuantizationModifier for the awq-only path (round-to-nearest int4
     after AWQ scaling) and GPTQModifier for the other two (Hessian-based
     int4 quantization).
+
+    DeepSeek-MoE-16B's per-expert `mlp.down_proj` weight has 10944 columns,
+    which is not divisible by 128 (10944 / 128 = 85.5). llm-compressor
+    hard-fails on this in `validate_group_size_divisibility`, AND the
+    bypass flag (which IS valid on GPTQModifier/QuantizationModifier via
+    QuantizationMixin) is a *validation* bypass only — the actual tensor
+    reshape at calibration time (`unflatten(-1, (-1, 128))`) still
+    re-raises a RuntimeError when 10944 % 128 != 0. So for DeepSeek we
+    add `mlp.down_proj` to the `ignore` list (leaving that projection in
+    bf16) AND for the AWQ path we provide explicit `mappings=` that omit
+    the up_proj -> down_proj scaling pair, because AWQ's `_compute_layer_means`
+    would otherwise divide by zero on an empty down_proj set (job
+    32266239 2026-10-05 15:43). OLMoE/Qwen3/Mixtral all have columns %
+    128 == 0 (16384, 768, 1024 respectively) so they need no special
+    handling. GPTQ also gets `dampening_frac=0.02` (default 0.01) for
+    DeepSeek to reduce the 14.2% Hessian-inversion fallback rate that
+    was seen on 32266240.
     """
     ignore = [
         "lm_head",
         "re:.*mlp\\.gate$",
         "re:.*mlp\\.shared_expert_gate$",
     ]
+    is_deepseek = "deepseek" in (model_id or "").lower()
+    if is_deepseek:
+        # DeepSeek-MoE per-expert mlp.down_proj is [?, 10944], not
+        # divisible by 128. Skip it (stays bf16). See docstring.
+        ignore = ignore + ["re:.*\\.down_proj$"]
+    # DeepSeek: explicit AWQ mappings omitting the up_proj -> down_proj
+    # pair (which would otherwise ZeroDivisionError at _compute_layer_means
+    # because down_proj is in the quant ignore list).
+    deepseek_awq_mappings = [
+        AWQMapping(
+            smooth_layer="re:.*input_layernorm$",
+            balance_layers=["re:.*q_proj$", "re:.*k_proj$", "re:.*v_proj$"],
+        ),
+        AWQMapping(
+            smooth_layer="re:.*v_proj$",
+            balance_layers=["re:.*o_proj$"],
+        ),
+        AWQMapping(
+            smooth_layer="re:.*post_attention_layernorm$",
+            balance_layers=["re:.*gate_proj$", "re:.*up_proj$"],
+        ),
+        # NOTE: no up_proj -> down_proj mapping for DeepSeek.
+    ]
     if recipe == "awq":
+        awq = (
+            AWQModifier(mappings=deepseek_awq_mappings, duo_scaling="both", n_grid=10)
+            if is_deepseek
+            else AWQModifier(duo_scaling="both", n_grid=10)
+        )
         return [
-            AWQModifier(duo_scaling="both", n_grid=10),
+            awq,
             QuantizationModifier(targets="Linear", scheme="W4A16", ignore=ignore),
         ]
     if recipe == "gptq":
-        return [
-            GPTQModifier(targets="Linear", scheme="W4A16", ignore=ignore),
-        ]
+        gptq_kwargs = {"targets": "Linear", "scheme": "W4A16", "ignore": ignore}
+        if is_deepseek:
+            gptq_kwargs["dampening_frac"] = 0.02
+        return [GPTQModifier(**gptq_kwargs)]
     if recipe == "awq_gptq":
+        awq = (
+            AWQModifier(mappings=deepseek_awq_mappings, duo_scaling="both", n_grid=10)
+            if is_deepseek
+            else AWQModifier(duo_scaling="both", n_grid=10)
+        )
+        gptq_kwargs = {"targets": "Linear", "scheme": "W4A16", "ignore": ignore}
+        if is_deepseek:
+            gptq_kwargs["dampening_frac"] = 0.02
         return [
-            AWQModifier(duo_scaling="both", n_grid=10),
-            GPTQModifier(targets="Linear", scheme="W4A16", ignore=ignore),
+            awq,
+            GPTQModifier(**gptq_kwargs),
         ]
     raise ValueError(f"unknown recipe: {recipe!r}")
 
@@ -234,16 +367,51 @@ def main():
         # Without it, transformers v5.x prompts interactively via input()
         # to ask "Do you wish to run the custom code? [y/N]" and SLURM
         # has no TTY -> EOFError on every DeepSeek run.
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_id,
-            dtype=torch.bfloat16,
-            trust_remote_code=True,
-        )
+        #
+        # Force `rope_scaling=None` in the model config before construction.
+        # The Hub's modeling_deepseek.py is for a newer transformers than
+        # v5.15.1; in v5.x, `PreTrainedConfig.__init__` calls
+        # `convert_rope_params_to_dict` which materializes a missing/null
+        # `rope_scaling` into a truthy `rope_parameters` dict like
+        # `{"rope_theta": 10000}` (no "type" key). The Hub code's
+        # `if rope_scaling is None: ... else: rope_scaling["type"]` then
+        # crashes with `KeyError: 'type'`. Forcing None on the config class
+        # attribute (read by `getattr(config, "rope_scaling", None)`) makes
+        # the dynamic module's rope init take the no-scaling branch.
+        try:
+            from transformers import AutoConfig  # type: ignore
+            _cfg = AutoConfig.from_pretrained(args.model_id, trust_remote_code=True)
+            if not getattr(_cfg, "rope_scaling", None) or (
+                isinstance(_cfg.rope_scaling, dict)
+                and "type" not in _cfg.rope_scaling
+            ):
+                # Reset the cached field so the dynamic module sees None.
+                try:
+                    _cfg.rope_scaling = None
+                except (AttributeError, ValueError):
+                    # Some v5.x configs make rope_scaling a property; reset
+                    # via __dict__ if so.
+                    if "rope_scaling" in _cfg.__dict__:
+                        _cfg.__dict__["rope_scaling"] = None
+                print(f"[awq-quant] reset config.rope_scaling=None for {args.model_id!r}")
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_id,
+                dtype=torch.bfloat16,
+                trust_remote_code=True,
+                config=_cfg,
+            )
+        except Exception as _e:
+            print(f"[awq-quant][warn] config-normalize path failed ({_e}); falling back to direct load")
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_id,
+                dtype=torch.bfloat16,
+                trust_remote_code=True,
+            )
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_id, trust_remote_code=True,
     )
 
-    recipe = build_recipe(args.recipe)
+    recipe = build_recipe(args.recipe, args.model_id)
     recipe_label = {
         "awq": "AWQ-only",
         "gptq": "GPTQ-only",

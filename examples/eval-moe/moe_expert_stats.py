@@ -1488,110 +1488,148 @@ def main() -> None:
         for quant in args.quant:
             cell_label = f"model={model}, quant={quant or '<none>'}"
             logger.info("=== cell: %s ===", cell_label)
-
-            num_experts, num_experts_per_tok, num_hidden_layers, hf_model_type = (
-                _read_model_config(model)
-            )
-            # Stamp the actual architecture name. The benchmark loaders
-            # hardcode "olmoe" for `BenchmarkPrompts.arch_name`, but
-            # `model_arch.name` should reflect the real HF model_type so
-            # cross-arch views (sister-repo aggregator, Jaccard print
-            # headers) don't mislabel Qwen3 / Mixtral / DeepSeek / gpt-oss
-            # all as "olmoe".
-            effective_arch_name = _hf_arch_name(hf_model_type)
-            logger.info(
-                "Model config: num_experts=%d, num_experts_per_tok=%d, "
-                "num_hidden_layers=%d, model_type=%s (-> arch_name=%s)",
-                num_experts,
-                num_experts_per_tok,
-                num_hidden_layers,
-                hf_model_type,
-                effective_arch_name,
-            )
-
-            llm = _build_llm(
-                model=model,
-                quant=quant,
-                max_model_len=args.max_model_len,
-                dtype=args.dtype,
-                gpu_memory_utilization=args.gpu_memory_utilization,
-                enforce_eager=args.enforce_eager,
-                seed=args.seed,
-                tensor_parallel_size=args.tensor_parallel_size,
-                hf_overrides=(
-                    json.loads(args.hf_overrides)
-                    if args.hf_overrides else None
-                ),
-            )
-
-            # Tokenizer for per-prompt prefill counts (so the
-            # per-row `n_tokens_prefill` field matches what vLLM
-            # actually sees).
-            tokenizer = llm.get_tokenizer()
-
-            for benchmark_name in args.benchmarks:
-                # Idempotency check: if this (model, quant, benchmark)
-                # cell's JSON already exists, skip the workload. The
-                # canonical output path mirrors the sbatch's
-                # `--output-dir` arg. To force a re-run, delete the
-                # JSON before submitting.
-                _cell_out = (
-                    output_dir
-                    / _safe_id(model)
-                    / _safe_id(quant)
-                    / f"moe-{benchmark_name}"
-                    / "expert_counts.json"
-                )
-                if _cell_out.exists():
-                    logger.info(
-                        "Skipping cell: model=%s, quant=%s, benchmark=%s "
-                        "(output already exists at %s; delete to rerun)",
-                        model,
-                        quant or "<none>",
-                        benchmark_name,
-                        _cell_out,
-                    )
-                    continue
-
-                loader = BENCHMARK_LOADERS[benchmark_name]
-                benchmark = loader(
-                    num_samples=args.num_samples,
-                    seed=args.seed,
-                    n_shot=args.n_shots,
-                )
-                _run_benchmark(
-                    llm=llm,
-                    benchmark=benchmark,
-                    sampling_params=sampling_params,
-                    num_layers=num_hidden_layers,
-                    num_experts=num_experts,
-                    top_k=num_experts_per_tok,
+            # Per-cell try/except so one broken model (e.g. a W4A16
+            # checkpoint that vLLM's CompressedTensorsMoEMethod rejects
+            # because a projection is bf16 vs int4) doesn't kill the
+            # whole sweep. The bad cell gets logged with a full
+            # traceback; subsequent cells continue. Reruns are
+            # idempotent — cells whose output JSON already exists are
+            # skipped — so a partial failure is recoverable by just
+            # resubmitting the sbatch.
+            try:
+                _run_one_cell(
                     model=model,
                     quant=quant,
-                    num_samples=args.num_samples,
-                    n_shot=args.n_shots,
-                    tokenizer=tokenizer,
+                    args=args,
                     output_dir=output_dir,
-                    max_model_len=args.max_model_len,
-                    max_tokens=args.max_tokens,
-                    arch_name=effective_arch_name,
+                    sampling_params=sampling_params,
+                )
+            except Exception:
+                logger.exception(
+                    "CELL FAILED: %s. Continuing with next cell. "
+                    "Fix the underlying issue and re-submit the sbatch "
+                    "(idempotent re-run; cells with existing JSON are skipped).",
+                    cell_label,
                 )
 
-            # Free GPU memory + tear down torch.distributed before the
-            # next cell so two models don't have to fit in VRAM
-            # simultaneously.
-            import gc
-            import torch
-
-            del llm
-            gc.collect()
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                with contextlib.suppress(Exception):
-                    torch.distributed.destroy_process_group()
-            if torch.accelerator.is_available():
-                torch.accelerator.empty_cache()
-
     logger.info("All %d cell(s) complete; tree at %s", n_cells, output_dir)
+
+
+def _run_one_cell(
+    model: str,
+    quant: str,
+    args,
+    output_dir: Path,
+    sampling_params,
+) -> None:
+    """Run a single (model, quant) cell through all benchmarks.
+
+    Pulled out of main() so the caller can wrap each cell in
+    try/except — one broken model (e.g. a W4A16 checkpoint that vLLM
+    refuses because of a per-projection mixed-precision mismatch)
+    must not kill the rest of the sweep. See main() for the call site.
+    """
+    num_experts, num_experts_per_tok, num_hidden_layers, hf_model_type = (
+        _read_model_config(model)
+    )
+    # Stamp the actual architecture name. The benchmark loaders
+    # hardcode "olmoe" for `BenchmarkPrompts.arch_name`, but
+    # `model_arch.name` should reflect the real HF model_type so
+    # cross-arch views (sister-repo aggregator, Jaccard print
+    # headers) don't mislabel Qwen3 / Mixtral / DeepSeek / gpt-oss
+    # all as "olmoe".
+    effective_arch_name = _hf_arch_name(hf_model_type)
+    logger.info(
+        "Model config: num_experts=%d, num_experts_per_tok=%d, "
+        "num_hidden_layers=%d, model_type=%s (-> arch_name=%s)",
+        num_experts,
+        num_experts_per_tok,
+        num_hidden_layers,
+        hf_model_type,
+        effective_arch_name,
+    )
+
+    llm = _build_llm(
+        model=model,
+        quant=quant,
+        max_model_len=args.max_model_len,
+        dtype=args.dtype,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=args.enforce_eager,
+        seed=args.seed,
+        tensor_parallel_size=args.tensor_parallel_size,
+        hf_overrides=(
+            json.loads(args.hf_overrides)
+            if args.hf_overrides else None
+        ),
+    )
+
+    # Tokenizer for per-prompt prefill counts (so the
+    # per-row `n_tokens_prefill` field matches what vLLM
+    # actually sees).
+    tokenizer = llm.get_tokenizer()
+
+    for benchmark_name in args.benchmarks:
+        # Idempotency check: if this (model, quant, benchmark)
+        # cell's JSON already exists, skip the workload. The
+        # canonical output path mirrors the sbatch's
+        # `--output-dir` arg. To force a re-run, delete the
+        # JSON before submitting.
+        _cell_out = (
+            output_dir
+            / _safe_id(model)
+            / _safe_id(quant)
+            / f"moe-{benchmark_name}"
+            / "expert_counts.json"
+        )
+        if _cell_out.exists():
+            logger.info(
+                "Skipping cell: model=%s, quant=%s, benchmark=%s "
+                "(output already exists at %s; delete to rerun)",
+                model,
+                quant or "<none>",
+                benchmark_name,
+                _cell_out,
+            )
+            continue
+
+        loader = BENCHMARK_LOADERS[benchmark_name]
+        benchmark = loader(
+            num_samples=args.num_samples,
+            seed=args.seed,
+            n_shot=args.n_shots,
+        )
+        _run_benchmark(
+            llm=llm,
+            benchmark=benchmark,
+            sampling_params=sampling_params,
+            num_layers=num_hidden_layers,
+            num_experts=num_experts,
+            top_k=num_experts_per_tok,
+            model=model,
+            quant=quant,
+            num_samples=args.num_samples,
+            n_shot=args.n_shots,
+            tokenizer=tokenizer,
+            output_dir=output_dir,
+            max_model_len=args.max_model_len,
+            max_tokens=args.max_tokens,
+            arch_name=effective_arch_name,
+        )
+
+    # Free GPU memory + tear down torch.distributed before the
+    # next cell so two models don't have to fit in VRAM
+    # simultaneously.
+    import gc
+    import torch
+
+    del llm
+    gc.collect()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        with contextlib.suppress(Exception):
+            torch.distributed.destroy_process_group()
+    if torch.accelerator.is_available():
+        torch.accelerator.empty_cache()
 
 
 if __name__ == "__main__":
