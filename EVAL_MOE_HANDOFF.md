@@ -1307,3 +1307,61 @@ H100, matching the bf16/w8a16 precedent from `vllm-moe-eval-h100-w8a16-mixtral-t
 4. **Optional**: re-prequant DeepSeek with `awq_gptq` recipe too —
    just adds 1 more cell. Probably skip.
 5. **Cross-archive Jaccard sweep** in sister repo after #1 lands.
+
+
+---
+
+## ADDENDUM 6 (added Oct 8, 2026 — DeepSeek re-prequant SUCCEEDED)
+
+The `c016fe05` group_size=64 fix worked. Both DeepSeek re-prequant jobs
+landed clean today (Oct 8 11:00–11:33 AEST):
+
+- **32518557** (AWQ): 27m51s wall, exit 0. Saved 8.7 GB
+- **32518558** (GPTQ): 5m33s wall, exit 0. Saved 8.7 GB. 10.3% Hessian
+  inversion fallback (vs 23.9% on the prior bf16-down_proj run with
+  group_size=128 — the smaller group_size gives the Hessian more
+  degrees of freedom, fewer singular matrices).
+
+The new ckpts at `${SCRATCH}/hf_cache_awq/deepseek-ai--deepseek-moe-16b-chat-{awq,gptq}/`:
+
+- 8.7 GB each (down from 16 GB with the bf16 down_proj)
+- `quantization_config.config_groups.group_0.weights.group_size = 64`
+- `ignore = None` (no `down_proj` exclusion)
+- `recipe.yaml` shows the full AWQ `mappings=[...]` including the
+  up_proj → down_proj scaling pair
+
+**Tensors verified** via safetensors header inspection:
+- 1728 routed-expert `down_proj.weight_packed` (int4) + scale tensors
+- 27 `mlp.shared_experts.down_proj.weight_packed` (int4)
+- 1 special L00 `mlp.down_proj` (the dense layer-0 MLP, also int4 packed)
+- Total: 1755 int4 down_proj tensors, **zero bf16 down_proj anywhere**
+- Shape sanity: `down_proj.weight_packed = [2048, 10944/8=1368]` for the
+  dense L00, `[2048, 10944/8=1368]` is the column-dim check confirming
+  the 10944 columns are correctly packed at group_size=64 (171 scale
+  groups per row, 2048 rows = `weight_scale: [2048, 171]`)
+
+**W4A16 analyzer sweep for DeepSeek × 2 submitted** as job **32525399**
+(PENDING, gpu-h100, 12h wall, TP=1, NGPUS=1). With the new ckpts,
+vLLM's `CompressedTensorsMoEMethod.get_moe_method` should accept the
+same-scheme invariant and the cell should produce 10 expert_counts.json.
+
+**Once 32525399 lands** the W4A16 sweep goes from 20 → 30 expert_counts.json
+(adding 10 DeepSeek cells). Total sweep coverage then:
+- bf16: 20 cells (4×5)
+- fp8: 20 cells (4×5) [partial — fp8_dl has 5 more, see doc §6.2]
+- W8A16: 20 cells (4×5) [uploaded to MediaFlux]
+- W4A16: 30 cells (3 models × 2 recipes × 5; DeepSeek still missing × 2)
+
+**Still pending the W4 sweep**: Mixtral TP=4 (job 32517565, start
+2026-10-16 13:30). The new DeepSeek analyzer job 32525399 is much
+shorter and should land well before the Mixtral job.
+
+### Update to validation helper
+
+The `validate_deepseek_prequant.py` smoke-test script worked exactly as
+designed on the synthetic `nn.Linear(4096, 10944)` layer. To extend it
+for post-quant validation (next iteration), add a 4th check that loads
+the actual saved `model.safetensors` and asserts every `down_proj.weight`
+key has a corresponding `weight_packed` int4 tensor (no `bf16` weight).
+
+Co-authored-by: Hermes Agent <noreply@nousresearch.com>
