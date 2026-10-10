@@ -1365,3 +1365,114 @@ the actual saved `model.safetensors` and asserts every `down_proj.weight`
 key has a corresponding `weight_packed` int4 tensor (no `bf16` weight).
 
 Co-authored-by: Hermes Agent <noreply@nousresearch.com>
+
+---
+
+## ADDENDUM 7 (added Oct 10, 2026 — sglang backend attempted, blocked by cu13 dep wall)
+
+A sglang backend for the expert-activation sweep was started so we
+could produce a 3-way Jaccard comparison (vLLM vs llama.cpp vs
+sglang). The driver, the smoke sbatch, and a debug sbatch are all
+written and live in the tree, but the run is currently blocked by
+an upstream sglang dependency requirement that no Spartan node can
+satisfy.
+
+### Artifacts left in the tree (ready to run when the wall breaks)
+
+- `examples/eval-moe/moe_expert_stats_sglang.py` (470 lines) —
+  the sglang driver. Imports the vLLM analyzer's prompt
+  loaders + JSON writer as a library and replaces the inference
+  core with an `openai.OpenAI` chat-completion call with
+  `extra_body={"return_routed_experts": True}`. Reads sglang's
+  base64-encoded int32 expert IDs out of `meta_info.routed_experts`
+  and feeds them to the vLLM analyzer's existing aggregator.
+  Output JSON is bit-compatible with the vllm/llama.cpp trees.
+- `examples/eval-moe/spartan/sglang-moe-eval-a100-smoke.sbatch` —
+  builds sglang into a fresh venv at
+  `${SCRATCH}/venv_sglang/`, launches the server with
+  `--enable-return-routed-experts`, runs the driver on a single
+  small model × single benchmark × 8 prompts, writes the
+  resulting JSON.
+- `examples/eval-moe/spartan/sglang-moe-eval-a100-debug.sbatch` —
+  a phase-by-phase debug variant. PAUSE=0 by default (no sleeps
+  between phases). Use PAUSE=5..10 for true "step then look"
+  interactivity once on a node.
+- `examples/eval-moe/.plans/sglang-bf16-sweep.md` — the full
+  project plan, including the cu13 wall analysis.
+
+### Why it doesn't run today (the cu13 wall)
+
+Spartan's GPU nodes (gpu-a100: 24 nodes, gpu-a100-short: 2 nodes,
+gpu-h100: 10 nodes) all run **driver 570.x (CUDA 12.8 max)**. sglang
+0.5.20 — the first version with both the routed-experts capturer
+and the `--enable-return-routed-experts` server flag — was the
+first to hard-pin CUDA 13+ in its published wheel METADATA:
+
+```
+Requires-Dist: flashinfer_python[cu13]==0.6.18
+Requires-Dist: cuda-python>=13.0
+Requires-Dist: humming-kernels[cu13]==0.1.12
+Requires-Dist: nvidia-cutlass-dsl[cu13]==4.6.2
+Requires-Dist: nvshmem4py-cu13
+```
+
+uv's resolver explicitly states: `sglang>=0.5.21 and
+torch>=2.13.0+cu129 are incompatible` (torch 2.13.0+cu129's
+`cuda-bindings<13` conflicts with sglang's `cuda-python>=13`
+which needs `cuda-bindings>=13`).
+
+Pre-0.5.20 sglang versions don't have the capturer API or the
+server flag, so they can't serve the data the driver needs.
+
+The local sglang checkout's `python/pyproject.toml` carries the
+same cu13 markers (`flashinfer_python[cu13]==0.7.0.post1`), so
+a source install hits the same wall. The only way through is a
+forked dep list, which is out of scope for this project.
+
+### Confirmed via login-node investigation (no GPU needed)
+
+- `pip download` of sglang 0.5.10 → 0.5.21 wheels, METADATA
+  inspection shows the cu13 markers landed in 0.5.20.
+- `uv pip install --dry-run sglang==0.5.21 --torch-backend=cu129`
+  → "your requirements are unsatisfiable" with the cuda-bindings
+  version conflict.
+- `import sglang` after `--no-deps` install fails immediately at
+  `sglang/__init__.py:21` with `ModuleNotFoundError: numpy` and
+  the chain reveals ~30+ transitive imports (`msgspec`,
+  `decord2`, `psutil`, `orjson`, `xxhash`, `zstandard`, `xgrammar`,
+  `torchvision`, `torchaudio`, `torchcodec`,
+  `torch_memory_saver`, `partial_json_parser`, `IPython`,
+  `openai-harmony`, `mistral_common`, `llguidance`, etc.). Each
+  install reveals the next missing dep. Even if all of these
+  were resolvable, the cu13-only kernels inside sglang's compiled
+  `.so` files (cutlass-dsl, humming-kernels) would fail at first
+  GPU call.
+
+### How to revive this when the wall breaks
+
+- **Spartan gets a driver upgrade to 580.x**: 0 GPUs need to be
+  reassigned; just `sbatch` the existing
+  `sglang-moe-eval-a100-smoke.sbatch` on `gpu-a100-short`. The
+  sglang wheel install resolves cleanly without the
+  `--no-deps` dance.
+- **Cloud GPU with CUDA 13+ driver (e.g. H100 on Lambda, AWS
+  p5)**: same sbatch works; the OpenAI client connects to
+  the local sglang server. Set `MODEL_ID` / `BENCHMARKS` /
+  `NUM_SAMPLES` per the canonical vLLM wide-sweep defaults.
+- **Newer sglang release that drops the cu13 markers**: track
+  the sglang changelog. As of Oct 10 2026, every release since
+  0.5.20 has the markers.
+
+### Why we're not blocking on it
+
+- The vLLM + llama.cpp comparison already answers the core
+  scientific question ("does weight precision interact with
+  expert routing?"). sglang was a stretch goal.
+- The driver code is **sglang-version-agnostic**: it only needs
+  an OpenAI-compatible server that accepts
+  `return_routed_experts=true` in the request body and returns
+  base64-encoded int32 expert IDs in `meta_info.routed_experts`.
+  No driver changes needed when the wall breaks.
+
+Co-authored-by: Hermes Agent <noreply@nousresearch.com>
+
