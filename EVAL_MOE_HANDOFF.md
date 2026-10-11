@@ -1474,5 +1474,70 @@ forked dep list, which is out of scope for this project.
   base64-encoded int32 expert IDs in `meta_info.routed_experts`.
   No driver changes needed when the wall breaks.
 
+### ADDENDUM 7.1 (added Oct 11, 2026 — deeper sgl-kernel investigation)
+
+Tried to break the cu13 wall with `pip install
+sglang-kernel==0.4.2.post2 --index-url
+https://docs.sglang.io/whl/cu129` (the cu128 sgl-project/whl
+index exists) and a custom libnvrtc.so.12 -> .so.13 symlink.
+
+Result: the cu13 wall is **deeper than sglang's METADATA** —
+it lives in `sgl-kernel` (renamed to `sglang-kernel` in 0.4.0).
+The PyPI `sgl-kernel` and `sglang-kernel` wheels **both** ship
+a `sm100/common_ops.abi3.so` that links against
+`libnvrtc.so.13`, `libcublas.so.13`, `libcudart.so.13`. There is
+no cu12 variant of this file — sglang has dropped cu12 support
+entirely, even for SM80 (A100) on the cu128 wheel.
+
+Confirmed via the sgl-project/whl wheel index
+(https://github.com/sgl-project/whl, the PEP 503 index that
+sglang's docs point to for custom cu installs):
+
+| cu    | sgl-kernel (old name) | sglang-kernel (new name) |
+| ----- | --------------------- | ------------------------ |
+| cu118 | not built             | not built                 |
+| cu124 | not built             | not built                 |
+| **cu128** | **0.0.8 → 0.3.14.post1** (52 versions) | not built |
+| cu129 | 0.0.x → 0.3.8         | 0.4.x → 0.4.6.post1      |
+| cu130 | 0.0.x → 0.3.21        | 0.4.x → 0.4.9             |
+
+Both names' wheels bundle the same `sm100/common_ops.abi3.so`
+which has cu13 ABI symbols. sgl-kernel 0.3.14.post1's
+`__init__.py` has the same arch-detection logic as 0.4.x: SM90
+Hopper → `sm90/`, anything else (including SM80 A100) →
+`sm100/`. The sm100 .so is the same cu13 file in both
+versions.
+
+**No cu12-compatible sgl-kernel wheel exists on PyPI or on
+docs.sglang.io**. The only way to run sglang on A100 is to
+build sgl-kernel from source
+(`/data/gpfs/projects/uom00014/sglang/python/sglang/kernels/aot`)
+against the cu12 toolchain on the GPU node. sglang's own docs
+explicitly say A100/sm80 is supported only with cu118 / cu128
+driver wheels, and the index only provides cu128 wheels for
+`sm90`+architectures (A100/sm80 is no longer built — see
+https://github.com/sgl-project/whl/releases for the full
+arch list per wheel).
+
+A source build of sgl-kernel against cu12 would:
+1. Take ~30 min to cmake-compile (large CUDA kernel library)
+2. Need a forked pyproject.toml to drop the `torch==2.14.1`
+   pin (which is cu130)
+3. Risk subtle cu12/cu13 ABI differences in cutlass / cublasLt
+   that sgl-kernel depends on
+
+This is well beyond the scope of a 1-2 hour debug session. The
+sglang backend is parked permanently on the current Spartan
+driver stack. To resume:
+
+- Wait for Spartan driver 580+ (cu13)
+- Or move sglang backend to a cloud H100 with cu13 driver
+- Or fork sgl-kernel and build from source against cu12 (high
+  risk of further cu12-specific breakages)
+
+The sglang driver (`moe_expert_stats_sglang.py`) and the
+sbatches are version-agnostic and will work unchanged on any
+of the above paths.
+
 Co-authored-by: Hermes Agent <noreply@nousresearch.com>
 
