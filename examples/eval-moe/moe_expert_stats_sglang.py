@@ -267,17 +267,28 @@ def _run_sglang(
             continue
         choice = resp.choices[0]
         meta = getattr(choice, "model_extra", None) or {}
-        # sglang stuffs routed_experts under `meta_info` inside
-        # `model_extra`; the OpenAI SDK deserialises it into the
-        # `message` -> it can also be at the top level depending on
-        # version. Try both.
-        meta_info = meta.get("meta_info", meta)
-        routed = _decode_routed_experts(
-            meta_info,
-            num_layers=num_hidden_layers,
-            num_experts=num_experts,
-            top_k=num_experts_per_tok,
-        )
+        # sglang stuffs routed_experts in different places across versions.
+        # Try in order:
+        #   1. top-level `sglext.routed_experts` (sglang 0.5.x OpenAI chat)
+        #   2. `meta_info.routed_experts` inside choice (older sglang,
+        #      completions endpoint)
+        #   3. top-level `meta_info.routed_experts` (raw JSON dict)
+        sglext = meta.get("sglext") or {}
+        if isinstance(sglext, dict) and sglext.get("routed_experts"):
+            routed = _decode_routed_experts(
+                {"routed_experts": sglext["routed_experts"]},
+                num_layers=num_hidden_layers,
+                num_experts=num_experts,
+                top_k=num_experts_per_tok,
+            )
+        else:
+            meta_info = meta.get("meta_info", meta)
+            routed = _decode_routed_experts(
+                meta_info,
+                num_layers=num_hidden_layers,
+                num_experts=num_experts,
+                top_k=num_experts_per_tok,
+            )
         # The completion text + token ids are not on the
         # OpenAI `Choice` object directly; we only need
         # `token_ids` for `aggregate_expert_counts`'s generated
