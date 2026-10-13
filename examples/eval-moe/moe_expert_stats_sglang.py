@@ -85,6 +85,7 @@ from moe_expert_stats import (  # noqa: E402  (path injection above)
     BenchmarkRow,
     _hf_arch_name,
     _read_model_config,
+    _resolve_local_snapshot,
     _safe_id,
     _tokenize_prompts,
     _write_per_benchmark_json,
@@ -95,6 +96,31 @@ from moe_expert_stats import (  # noqa: E402  (path injection above)
     load_mmlu_prompts,
     load_popqa_prompts,
 )
+
+
+def _read_num_fused_shared_experts(model: str) -> int:
+    """Return `n_shared_experts` for models with always-on shared experts
+    in their MoE block (DeepSeek-V2/V3, etc.). 0 for OLMoE / Mixtral /
+    Qwen3.
+
+    sglang's capturer flattens the buffer as
+        `(num_tokens, num_layers, top_k + n_shared)`
+    but only the first `top_k` slots per layer are the router's picks.
+    The trailing `n_shared` slots hold reserved IDs for the always-on
+    shared experts and should be dropped before aggregation — vLLM's
+    `routed_experts` tensor doesn't include them, so we must match
+    that cardinality for the Jaccard aggregator to compare apples to
+    apples.
+    """
+    from transformers import AutoConfig  # type: ignore[import-untyped]
+    local_path = _resolve_local_snapshot(model)
+    resolved = local_path if local_path else model
+    hf_config = AutoConfig.from_pretrained(resolved, trust_remote_code=True)  # type: ignore[no-untyped-call]
+    for name in ("n_shared_experts", "num_shared_experts"):
+        v = getattr(hf_config, name, None)
+        if v is not None:
+            return int(v)
+    return 0
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +178,7 @@ def _decode_routed_experts(
     num_layers: int,
     num_experts: int,
     top_k: int,
+    n_fused_shared_experts: int = 0,
 ) -> np.ndarray | None:
     """Decode sglang's base64-encoded `meta_info.routed_experts` into
     a `(seq_len, num_layers, top_k)` int32 numpy array.
@@ -167,6 +194,14 @@ def _decode_routed_experts(
     import time on a non-GPU login node. The decode is trivial
     enough to inline; we keep the helper available as a fallback
     via the `_HAS_NATIVE_HELPER` probe at startup.
+
+    `n_fused_shared_experts` controls whether we slice off the
+    always-on shared-expert IDs that sglang's capturer tacks on to
+    the per-layer stride (DeepSeek-V2/V3 has 2 shared experts; for
+    those models the capturer emits `(top_k + n_shared)` IDs per
+    layer slot, and we drop the trailing `n_shared` slots before
+    returning so the result matches vLLM's `routed_experts`
+    cardinality). For OLMoE / Mixtral / Qwen3 this is 0.
     """
     raw = meta_info.get("routed_experts")
     if raw is None:
@@ -186,17 +221,23 @@ def _decode_routed_experts(
         # sglang version bypasses the base64 path.
         flat = np.asarray(raw, dtype=np.int32).ravel()
 
-    expected = num_layers * top_k
-    if flat.size % expected != 0:
+    stride = top_k + n_fused_shared_experts
+    expected_per_token = num_layers * stride
+    if flat.size % expected_per_token != 0:
         raise ValueError(
             f"routed_experts has {flat.size} elements; expected a "
-            f"multiple of L*top_k = {num_layers}*{top_k} = {expected}. "
-            f"Check that the server was started with "
-            f"--enable-return-routed-experts and the request asked "
-            f"for return_routed_experts=true."
+            f"multiple of L*stride = {num_layers}*{stride} = "
+            f"{expected_per_token}. Check that the server was "
+            f"started with --enable-return-routed-experts and the "
+            f"request asked for return_routed_experts=true."
         )
-    seq_len = flat.size // expected
-    return flat.reshape(seq_len, num_layers, top_k)
+    seq_len = flat.size // expected_per_token
+    arr3d = flat.reshape(seq_len, num_layers, stride)
+    # If shared-expert slots were appended, drop them so the result
+    # matches vLLM's `(seq_len, num_layers, top_k)` cardinality.
+    if n_fused_shared_experts > 0:
+        arr3d = arr3d[:, :, :top_k]
+    return arr3d
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +262,7 @@ def _run_sglang(
     prompts: list[str],
     max_tokens: int,
     seed: int,
+    max_inflight: int = 32,
 ) -> list[_SglangRequestOutput]:
     """Send `prompts` to sglang and return RequestOutput-shims.
 
@@ -228,6 +270,13 @@ def _run_sglang(
     map each prompt to one `_SglangRequestOutput`. The routed
     experts come back via `meta_info.routed_experts`; we decode and
     stash them on the shim's `outputs[0]`.
+
+    `max_inflight` controls how many HTTP requests we have in flight
+    at once. sglang's server does continuous batching internally, so
+    firing many requests in parallel is what unlocks throughput.
+    Default 32 — high enough to keep an A100/H100 fully busy, low
+    enough not to OOM the client process. Set via the
+    `--max-inflight` CLI flag.
     """
     # We need (num_layers, num_experts, top_k) to decode the routed
     # experts. Read from the model config via the same helper the
@@ -235,36 +284,46 @@ def _run_sglang(
     num_experts, num_experts_per_tok, num_hidden_layers, _ = (
         _read_model_config(model)
     )
+    n_shared = _read_num_fused_shared_experts(model)
 
     # Build chat-completion kwargs. The
     # `return_routed_experts=True` extra field is the sglang
     # extension; the OpenAI SDK forwards it as-is in the request
     # body.
-    out: list[_SglangRequestOutput] = []
+    out: list[_SglangRequestOutput] = [
+        _SglangRequestOutput(prompt_token_ids=[], outputs=[])
+        for _ in prompts
+    ]
     n_done = 0
     t0 = time.monotonic()
-    for prompt in prompts:
-        # sglang expects the model name as it would be returned by
-        # /v1/models; for a local server with a single loaded model
-        # this is the same as the HF id.
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=0.0,
-            seed=seed,
-            extra_body={
-                "return_routed_experts": True,
-                # `routed_experts_start_len=0` means "from the
-                # first token"; the default is 0 but we set it
-                # explicitly so a future sglang default change
-                # doesn't silently shift the capture window.
-                "routed_experts_start_len": 0,
-            },
-        )
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _send_one(idx_prompt):
+        idx, prompt = idx_prompt
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0.0,
+                seed=seed,
+                extra_body={
+                    "return_routed_experts": True,
+                    # `routed_experts_start_len=0` means "from the
+                    # first token"; the default is 0 but we set it
+                    # explicitly so a future sglang default change
+                    # doesn't silently shift the capture window.
+                    "routed_experts_start_len": 0,
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "  prompt %d: sglang request failed: %s", idx, e
+            )
+            return idx, _SglangRequestOutput(prompt_token_ids=[], outputs=[])
+
         if not resp.choices:
-            out.append(_SglangRequestOutput(prompt_token_ids=[]))
-            continue
+            return idx, _SglangRequestOutput(prompt_token_ids=[])
         choice = resp.choices[0]
         meta = getattr(choice, "model_extra", None) or {}
         # sglang stuffs routed_experts in different places across versions.
@@ -280,6 +339,7 @@ def _run_sglang(
                 num_layers=num_hidden_layers,
                 num_experts=num_experts,
                 top_k=num_experts_per_tok,
+                n_fused_shared_experts=n_shared,
             )
         else:
             meta_info = meta.get("meta_info", meta)
@@ -288,6 +348,7 @@ def _run_sglang(
                 num_layers=num_hidden_layers,
                 num_experts=num_experts,
                 top_k=num_experts_per_tok,
+                n_fused_shared_experts=n_shared,
             )
         # The completion text + token ids are not on the
         # OpenAI `Choice` object directly; we only need
@@ -305,25 +366,40 @@ def _run_sglang(
             # totals.{tokens_total} field. The aggregate's
             # `_generate_n` is only used for that field.
             token_ids = [0] * max(1, len(content) // 4)
-        out.append(
-            _SglangRequestOutput(
-                prompt_token_ids=[],  # OpenAI SDK doesn't surface this
-                outputs=[
-                    _SglangCompletion(
-                        routed_experts=routed,
-                        token_ids=token_ids,
-                    )
-                ],
-            )
+        return idx, _SglangRequestOutput(
+            prompt_token_ids=[],  # OpenAI SDK doesn't surface this
+            outputs=[
+                _SglangCompletion(
+                    routed_experts=routed,
+                    token_ids=token_ids,
+                )
+            ],
         )
-        n_done += 1
-        if n_done % 25 == 0:
-            elapsed = time.monotonic() - t0
-            rate = n_done / max(elapsed, 1e-6)
-            logger.info(
-                "  %d/%d prompts done (%.1f/s, %.0fs elapsed)",
-                n_done, len(prompts), rate, elapsed,
-            )
+
+    with ThreadPoolExecutor(max_workers=max_inflight) as pool:
+        futures = [
+            pool.submit(_send_one, (i, p))
+            for i, p in enumerate(prompts)
+        ]
+        for fut in as_completed(futures):
+            try:
+                idx, req_out = fut.result()
+            except Exception as e:
+                logger.warning("  worker exception: %s", e)
+                continue
+            out[idx] = req_out
+            n_done += 1
+            if n_done % 100 == 0 or n_done == len(prompts):
+                elapsed = time.monotonic() - t0
+                rate = n_done / max(elapsed, 1e-6)
+                logger.info(
+                    "  %d/%d prompts done (%.1f/s, %.0fs elapsed)",
+                    n_done, len(prompts), rate, elapsed,
+                )
+    # Replace any None (shouldn't happen) with empty output.
+    for i, v in enumerate(out):
+        if v is None:
+            out[i] = _SglangRequestOutput(prompt_token_ids=[], outputs=[])
     return out
 
 
@@ -367,6 +443,7 @@ def _run_one_benchmark(
     output_dir: Path,
     quant_tag: str,
     arch_name: str,
+    max_inflight: int = 32,
 ) -> None:
     """Run one benchmark, aggregate, and write the per-cell JSON.
 
@@ -461,6 +538,7 @@ def _run_one_benchmark(
             prompts=prompts,
             max_tokens=max_tokens,
             seed=seed,
+            max_inflight=max_inflight,
         )
     except Exception as e:
         logger.exception("  sglang request batch failed: %s", e)
@@ -546,6 +624,12 @@ def _parse_args() -> argparse.Namespace:
         help="Sanity-cap the per-benchmark prompt count. 0 = no cap. "
              "Useful for smoke tests (set to e.g. 8 so MMLU doesn't "
              "try to run 14k prompts).",
+    )
+    p.add_argument(
+        "--max-inflight", type=int, default=32,
+        help="Number of concurrent HTTP requests to sglang. Higher = "
+             "more throughput on big benchmarks, lower = less client "
+             "memory. Default 32 (saturates an A100/H100).",
     )
     return p.parse_args()
 
@@ -639,6 +723,7 @@ def main() -> None:
                 output_dir=output_dir,
                 quant_tag=args.quant_tag,
                 arch_name=effective_arch,
+                max_inflight=args.max_inflight,
             )
 
     logger.info("All cells complete; tree at %s", output_dir)
