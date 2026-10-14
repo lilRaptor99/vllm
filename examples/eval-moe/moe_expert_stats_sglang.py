@@ -195,13 +195,22 @@ def _decode_routed_experts(
     enough to inline; we keep the helper available as a fallback
     via the `_HAS_NATIVE_HELPER` probe at startup.
 
-    `n_fused_shared_experts` controls whether we slice off the
-    always-on shared-expert IDs that sglang's capturer tacks on to
-    the per-layer stride (DeepSeek-V2/V3 has 2 shared experts; for
-    those models the capturer emits `(top_k + n_shared)` IDs per
-    layer slot, and we drop the trailing `n_shared` slots before
-    returning so the result matches vLLM's `routed_experts`
-    cardinality). For OLMoE / Mixtral / Qwen3 this is 0.
+    **Stride policy (verified on job 32933582, Oct 14)**:
+    sglang 0.5.9's capturer emits `(T, L, top_k)` int32 IDs —
+    matching vLLM's `routed_experts` cardinality. The shared-expert
+    IDs (for models with `n_fused_shared_experts > 0`, e.g.
+    DeepSeek-V2/V3 with 2 shared experts) are emitted in a
+    *separate* field, NOT concatenated onto the routed-experts
+    tensor. So the per-layer divisor is `top_k`, not
+    `top_k + n_fused_shared_experts`. The first version of this
+    driver assumed the latter; that's what the 42,566 "routed_experts
+    has N elements; expected multiple of L*stride = 28*8 = 224"
+    warnings in job 32933582 were about — the element counts were
+    all multiples of 168 (= 28 * 6 = L * top_k for DeepSeek).
+
+    For sglang versions that *do* concatenate the shared slots, the
+    fallback at the bottom of this function will try
+    `stride = top_k + n_fused_shared_experts` and slice the result.
     """
     raw = meta_info.get("routed_experts")
     if raw is None:
@@ -221,23 +230,31 @@ def _decode_routed_experts(
         # sglang version bypasses the base64 path.
         flat = np.asarray(raw, dtype=np.int32).ravel()
 
-    stride = top_k + n_fused_shared_experts
+    # Primary shape: (T, L, top_k) — what sglang 0.5.9 actually emits.
+    stride = top_k
     expected_per_token = num_layers * stride
-    if flat.size % expected_per_token != 0:
-        raise ValueError(
-            f"routed_experts has {flat.size} elements; expected a "
-            f"multiple of L*stride = {num_layers}*{stride} = "
-            f"{expected_per_token}. Check that the server was "
-            f"started with --enable-return-routed-experts and the "
-            f"request asked for return_routed_experts=true."
-        )
-    seq_len = flat.size // expected_per_token
-    arr3d = flat.reshape(seq_len, num_layers, stride)
-    # If shared-expert slots were appended, drop them so the result
-    # matches vLLM's `(seq_len, num_layers, top_k)` cardinality.
+    if flat.size % expected_per_token == 0:
+        seq_len = flat.size // expected_per_token
+        arr3d = flat.reshape(seq_len, num_layers, stride)
+        return arr3d
+    # Fallback: if a future sglang concatenates shared-expert slots,
+    # (T, L, top_k + n_shared). Slice off the trailing n_shared so
+    # the return shape still matches vLLM's `(seq_len, num_layers, top_k)`.
     if n_fused_shared_experts > 0:
-        arr3d = arr3d[:, :, :top_k]
-    return arr3d
+        stride = top_k + n_fused_shared_experts
+        expected_per_token = num_layers * stride
+        if flat.size % expected_per_token == 0:
+            seq_len = flat.size // expected_per_token
+            arr3d = flat.reshape(seq_len, num_layers, stride)
+            return arr3d[:, :, :top_k]
+    raise ValueError(
+        f"routed_experts has {flat.size} elements; expected a multiple "
+        f"of L*top_k = {num_layers}*{top_k} = {expected_per_token} (or, "
+        f"with shared slots, L*(top_k+n_shared) = "
+        f"{num_layers}*{top_k + n_fused_shared_experts}). Check that the "
+        f"server was started with --enable-return-routed-experts and "
+        f"the request asked for return_routed_experts=true."
+    )
 
 
 # ---------------------------------------------------------------------------
