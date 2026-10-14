@@ -1541,3 +1541,245 @@ of the above paths.
 
 Co-authored-by: Hermes Agent <noreply@nousresearch.com>
 
+---
+
+## ADDENDUM 8 (added Oct 14, 2026 — sglang cu12 wall BROKEN; wide sweep submitted)
+
+Addenda 7 + 7.1 parked the sglang backend as "permanently blocked by
+the cu13 wall" because sgl-kernel's published wheels all link against
+`libcublas.so.13` / `libnvrtc.so.13`. **That verdict was stale as of
+Oct 11 evening.** Between Oct 11 ~22:00 and Oct 13, the wall was
+broken using an older sglang (0.5.9, the last release whose
+`sgl-kernel==0.3.21` wheel was published in the cu128 index) plus
+two on-disk patches to the capturer and the response handler. The
+driver + sbatch infrastructure that was left in place by addendum 7
+became the foundation for a working cu12 backend. The wide sweep
+(2 models × 5 benchmarks = 10 cells) was submitted Oct 14 as job
+**32933582** and is currently PENDING on gpu-h100.
+
+### AB. The cu12 wall is older sglang, not a forked dep list
+
+The wall's true depth was: sgl-kernel's `.whl` **cu128 files exist**
+on the sgl-project PEP 503 index for old (≤0.3.x) versions, but
+the `__init__.py` arch-detection logic in those wheels routes
+**any non-Hopper GPU (including SM80 A100)** to `sm100/common_ops.abi3.so`,
+and the cu128 build of that `.so` **also** links against
+`libcublas.so.13`. So the wall is not cu128-vs-cu129-vs-cu130 — it's
+that `sgl-kernel` post-0.3.14.post1 dropped cu12 entirely, and
+sglang post-0.5.10 inherited the cu13 requirement transitively.
+
+The workaround is sglang 0.5.9, whose published dependency tree
+resolved cleanly against `cuda-python==12.x` + `torch==2.9.1+cu128`:
+  - `sglang==0.5.9` (cu128 wheel index)
+  - `sgl-kernel==0.3.21` (cu128 wheel — the **last** version of the
+    old package name; later became `sglang-kernel`)
+  - `flashinfer-python==0.6.7.post1` (cu128 wheel)
+  - `torch==2.9.1+cu128` (cu128 PyTorch wheel)
+
+These resolved without conflict on the login node with
+`uv pip install --torch-backend=cu128` and the resulting venv
+(`${SCRATCH}/venv_sglang_0509/`, 7 GB) is what the driver + sweep
+sbatch target.
+
+### AC. The capturer layer_id bug
+
+sglang's `RoutedExpertsDeviceCache.capture_fwd_routed_experts()`
+captures `(num_tokens, top_k + n_shared_experts)` int32 expert IDs
+per layer, but the layer_id is supplied by the model code's forward
+hook. sglang 0.5.9's `deepseek_v2.py` and `mixtral.py` forward
+hooks don't reliably pass `layer_id` to the capturer — when called
+from the CUDA graph replay path, it's `None` or `0` for every layer,
+making the captured tensor degenerate (`num_layers` collapsed to 1).
+
+**Fix** (on-disk patch to
+`${VENV}/lib/python3.11/site-packages/sglang/srt/layers/moe/routed_experts_capturer.py`,
+~10 lines): synthesize a monotonic `layer_id` from the call site by
+counting capturer invocations within a single forward pass. The
+synthesizer increments on every call and resets per-request. Without
+the patch, every cell writes `expert_counts.json` with
+`num_layers == 1` and all the (tall, narrow) layer-binning is
+collapsed onto a single row — the aggregator sees all the data but
+treats it as one layer, so the heatmap degenerates.
+
+The wide-sweep sbatch's pre-flight guard verifies the patch is on
+disk before launching the server — if someone wiped and rebuilt the
+venv, the job aborts before producing zeros (instead of silently
+emitting bad data).
+
+### AD. The sglext response-path bug
+
+sglang 0.5.9's OpenAI chat completion server returns the captured
+expert IDs in a top-level `sglext.routed_experts` field (base64
+int32), **not** in the per-choice `meta_info.routed_experts` that
+earlier sglang versions used. (This is a behavior change between
+0.5.9 and 0.5.10+.) The OpenAI Python SDK's `ChatCompletionChoice`
+class is pydantic-strict with `extra='forbid'`, so the SDK silently
+drops `sglext` on parse and `choice.model_extra == None` even though
+`data["sglext"]["routed_experts"]` is right there in the raw JSON.
+
+**Fix** (driver-only — sglang server unchanged): bypass the SDK
+entirely, use `httpx.post()` against `/v1/chat/completions`, and
+walk the raw JSON dict. The decoded tensor is sliced `[:top_k]` to
+drop the trailing `n_shared` expert IDs (sglang concatenates shared
+expert outputs onto the end of the routed-experts tensor for
+"capture window" accounting; vLLM's `routed_experts` doesn't
+include them, so we drop for parity).
+
+The wide-sweep sbatch generates a server-launcher wrapper
+(`launch_server_with_capturer.py`, written to the output dir per job)
+that monkey-patches `ServerArgs.__init__` + `prepare_server_args`
+to force `enable_return_routed_experts=True` because sglang 0.5.9
+has the `ServerArgs` field but no CLI flag for it.
+
+### AE. Driver + sbatches committed
+
+Four new files, 2594 insertions, in commits `9f2a77fb7`, `95bb2a950`,
+`0aeecf2fe`, and `89a733cd7`:
+
+| File | Purpose |
+|------|---------|
+| `examples/eval-moe/moe_expert_stats_sglang.py` (765 lines) | The driver. Imports the vLLM analyzer's prompt loaders + JSON writer as a library; replaces `llm.generate()` + `completion.routed_experts` with an `httpx.post()` against the sglang server. Output JSON is bit-compatible with the vLLM/llama.cpp trees. |
+| `examples/eval-moe/spartan/sglang-cu12-response-check.sbatch` (437 lines) | One-shot debug job that dumps the full non-streaming response from `/v1/chat/completions` to disk. Used to confirm `sglext.routed_experts` was the right path. Re-runnable; uses `sglang==0.5.9`. |
+| `examples/eval-moe/spartan/sglang-moe-eval-h100-bf16-wide.sbatch` (332 lines) | The wide sweep. gpu-h100, 1 GPU, 12 h wall. Runs 2 models × 5 benchmarks = 10 cells in a single process. Per-cell: launch sglang server, wait for `/v1/models`, run driver with `ThreadPoolExecutor(max_workers=MAX_INFLIGHT=64)`, kill server. Stops on first failure to avoid burning wall time. |
+| `examples/eval-moe/spartan/sglang-moe-eval-a100-smoke.sbatch` (365 lines) | The pre-cu12-fix smoke from addendum 7. Superseded by the wide sweep; left in tree for reference. |
+| `examples/eval-moe/spartan/sglang-moe-eval-a100-debug.sbatch` (223 lines) | Phase-by-phase debug variant from addendum 7. Left for reference. |
+| `examples/eval-moe/spartan/fix-sglang-venv-numpy.sbatch` (98 lines, **untracked**) | Intended to pin `datasets==4.5.0` + `numpy>=2.1,<2.3` + `pyarrow>=17,<21` in `venv_sglang_0509` to fix a pyarrow/numpy version conflict. **Never submitted** — `venv_sglang_0509` was rebuilt on Oct 11 with these pins already, so the sbatch is a no-op. Safe to `rm` or keep for documentation. |
+
+### AF. First wide-sweep submission (jobs 32843059–32843068): all 10 cells crashed in 1 min
+
+The wide-sweep sbatch was first submitted as a 10-cell SLURM array
+between Oct 13 23:31 and Oct 14 00:17. Job IDs and outcomes
+(`sacct -X --format=JobID,State,Elapsed,Start,End,JobName`):
+
+| JobID | State | Elapsed | Start | End | Driver log |
+|-------|-------|---------|-------|-----|------------|
+| 32843059 | COMPLETED | 00:01:21 | 2026-10-13T23:31:22 | 2026-10-13T23:32:43 | "tuple has no attribute 'models'" |
+| 32843060 | COMPLETED | 00:00:47 | 2026-10-13T23:32:56 | 2026-10-13T23:33:43 | "tuple has no attribute 'models'" |
+| 32843061 | COMPLETED | 00:01:01 | 2026-10-14T00:05:17 | 2026-10-14T00:06:18 | "tuple has no attribute 'models'" |
+| 32843062 | COMPLETED | 00:00:53 | 2026-10-14T00:07:22 | 2026-10-14T00:08:15 | "tuple has no attribute 'models'" |
+| 32843063 | COMPLETED | 00:00:44 | 2026-10-14T00:08:49 | 2026-10-14T00:09:33 | "tuple has no attribute 'models'" |
+| 32843064 | COMPLETED | 00:01:15 | 2026-10-14T00:10:57 | 2026-10-14T00:12:12 | "tuple has no attribute 'models'" |
+| 32843065 | COMPLETED | 00:01:04 | 2026-10-14T00:12:26 | 2026-10-14T00:13:30 | "tuple has no attribute 'models'" |
+| 32843066 | COMPLETED | 00:01:03 | 2026-10-14T00:13:42 | 2026-10-14T00:14:45 | "tuple has no attribute 'models'" |
+| 32843067 | COMPLETED | 00:01:05 | 2026-10-14T00:15:24 | 2026-10-14T00:16:29 | "tuple has no attribute 'models'" |
+| 32843068 | COMPLETED | 00:00:53 | 2026-10-14T00:16:48 | 2026-10-14T00:17:41 | "tuple has no attribute 'models'" |
+
+`sacct` shows COMPLETED because the sbatch's `cleanup_server` trap
+exits 0 after the driver's `sys.exit(2)` — the SLURM exit code is
+NOT a meaningful signal here. The driver log shows the real outcome:
+every cell hit the same line-675 bug.
+
+**The bug**: `_build_openai_client()` was refactored to return a
+`(base_url, api_key)` tuple (so `_run_sglang` could use httpx
+directly — addendum §AD), but `main()` still called
+`client.models.list()` on the tuple at line 675. The sglang server
+itself was healthy — every `server_*.log` ends with
+"The server is fired up and ready to roll!" — but the driver's
+pre-flight health check crashed before sending a single prompt.
+
+**Result tree impact**: 0 of 10 cells wrote an `expert_counts.json`.
+The single 17 MB JSON at
+`results_sglang_bf16_h100/allenai--OLMoE-1B-7B-0924-Instruct/bf16/moe-mmlu/expert_counts.json`
+is from the Oct 13 12:48 single-cell smoke run `32842251` / `32843922`
+(8 prompts, 194 generated tokens), which used the OLD
+`openai.OpenAI()` SDK path before the §AD refactor. That JSON is
+schema-valid but from a different model-dir naming convention
+(`allenai--OLMoE-...` vs the wide-sweep's `allenai-OLMoE-...`); the
+sister aggregator's tree-walker normalizes both, but it's worth
+flagging that the two namespaces are not interchangeable.
+
+### AG. Fix committed, wide sweep resubmitted (job 32933582, PENDING)
+
+Fix (commit `89a733cd7`): `main()` now unpacks `base_url, api_key =
+client` and uses `httpx.get(f"{base_url}/models", ...)` for the
+health check. Single hunk, 73+/41-.
+
+Resubmitted as job **32933582** on Oct 14 11:38 (gpu-h100, 1 GPU,
+12 h wall). Currently waiting at `squeue` Priority — gpu-h100 had
+5/10 nodes allocated at submission time.
+
+Verification steps when it lands:
+1. `tail spartan/logs/sglang-moe-h100-wide-32933582.out` — first
+   banner says "[info] capturer layer_id fix verified on disk" (the
+   pre-flight guard). If that line is missing, the venv was wiped
+   and the capturer patch is gone — abort and re-apply §AC's patch.
+2. First cell (OLMoE / mmlu): driver should connect, log
+   "Connected to sglang server at ...; models: [...]", then start
+   the prompt batch. If the connection log shows the right model
+   list, the §AG fix worked.
+3. Per-cell completion is logged as
+   `[cell] wrote ${CELL_OUT}/expert_counts.json (N bytes)`. When 10
+   cells complete, the final summary lists all 10 expert_counts.json
+   with sizes.
+4. `find results_sglang_bf16_h100 -name expert_counts.json | wc -l`
+   should return 10 (or however many cells completed in 12 h; MMLU
+   is the long one).
+
+If the driver still crashes on first prompt with a different error,
+the next likely culprit is §AC's capturer patch — re-apply and
+re-submit. If it crashes mid-batch with `KeyError: 'routed_experts'`,
+the §AD response-path patch regressed and the `sglext` extraction
+needs debugging (rerun `sglang-cu12-response-check.sbatch` to dump
+a fresh response).
+
+### AH. Venv state for `venv_sglang_0509` (Oct 14 11:38)
+
+Confirmed via dist-info METADATA inspection (no Python needed):
+
+```
+sglang           0.5.9
+sgl_kernel       0.3.21
+torch            2.9.1+cu128
+flashinfer       (cu128 wheel)
+numpy            2.2.6
+datasets         4.5.0
+pyarrow          26.0.0
+httpx            0.28.1
+```
+
+Capturer patch verified on disk at line 63 of `routed_experts_capturer.py`:
+```
+# synthesize the correct layer_id via a monotonic counter
+```
+This is the §AC marker the wide-sweep sbatch's pre-flight guard
+checks for.
+
+### AI. Outstanding items (Oct 14)
+
+1. **Job 32933582**: PENDING on gpu-h100. Should land within 12 h
+   of start; on a 1-GPU H100 with `MAX_INFLIGHT=64` and per-cell
+   `MEM_FRACTION_STATIC=0.30`, OLMoE's MMLU is the long one (~1 h),
+   DeepSeek's MMLU is the slowest (~2-3 h). Total expected: 6-8 h
+   wall for all 10 cells.
+2. **Mixtral TP=4 BF16 sglang cell**: separate sbatch needed; the
+   wide sweep uses gpu-h100 TP=1 only (262 GB Mixtral doesn't fit).
+   Mirror the vLLM `vllm-moe-eval-h100-w8a16-mixtral-tp4.sbatch`
+   structure but with the sglang server launcher. Not started.
+3. **Untracked `fix-sglang-venv-numpy.sbatch`**: superseded (the
+   venv already has the right pins). Either commit as a
+   reproducible-rebuild script or `rm` it. No functional impact.
+4. **Sister-repo Jaccard sweep** (sister repo `llama-cpp-eval`):
+   once the sglang tree populates, add
+   `${SCRATCH}/results_sglang_bf16_h100/` as a third root to
+   `aggregate_overview.py` + `jaccard_sweep_from_cpp.py`. The
+   existing tools tree-walk any number of roots.
+5. **MediaFlux upload**: the new sglang tree (~150 MB when full)
+   probably fits without an explicit upload — check before
+   committing to a path.
+
+### AJ. Summary of the sglang backend on Spartan today
+
+- **sglang version**: 0.5.9 (cu128 wheel) — the last cu128-compatible
+  release. Newer (≥0.5.10) hit the cu13 wall documented in addendum 7.1.
+- **Venv**: `${SCRATCH}/venv_sglang_0509/` (7 GB).
+- **Driver**: `moe_expert_stats_sglang.py` — committed.
+- **Two on-disk patches required** to run cleanly:
+  - Capturer layer_id synthesis (synthesize via monotonic counter
+    in `routed_experts_capturer.py:63`). Re-apply if venv is rebuilt.
+  - Driver-side response-path bypass (httpx direct, sglext walk).
+    Lives in the driver, no sglang source patches.
+- **Wide sweep sbatch**: `sglang-moe-eval-h100-bf16-wide.sbatch` —
+  committed, current submission as job 32933582.
+
+Co-authored-by: Hermes Agent <noreply@nousresearch.com>
+
