@@ -245,14 +245,48 @@ def _decode_routed_experts(
 # ---------------------------------------------------------------------------
 
 def _build_openai_client(server: str, api_key: str = "EMPTY"):
-    """Return an `openai.OpenAI` client pointed at the sglang server.
-
-    sglang's HTTP server is OpenAI-compatible and ignores the
-    Authorization header when api_key == "EMPTY" (its default), so
-    we don't need to set up a real key.
+    """Return an `(base_url, api_key)` tuple. We use httpx directly
+    (not the openai SDK) because the SDK's ChatCompletionChoice class
+    is pydantic-strict (no extra fields), and sglang's
+    `sglext.routed_experts` is exactly an extra field. The SDK drops
+    it on parse and we end up with `model_extra == None`. httpx
+    returns the raw JSON which we walk directly.
     """
-    import openai
-    return openai.OpenAI(base_url=f"{server.rstrip('/')}/v1", api_key=api_key)
+    return (f"{server.rstrip('/')}/v1", api_key)
+
+
+def _send_one_chat_completion(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    seed: int,
+    timeout_s: float = 120.0,
+) -> dict:
+    """POST /v1/chat/completions via httpx. Returns the parsed JSON
+    response (raw dict — no SDK interpretation).
+    """
+    import httpx  # local import so a missing httpx doesn't kill the
+                  # CLI startup banner
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "seed": seed,
+        "return_routed_experts": True,
+        "routed_experts_start_len": 0,
+    }
+    r = httpx.post(
+        f"{base_url}/chat/completions",
+        json=body,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=timeout_s,
+    )
+    r.raise_for_status()
+    return r.json()
 
 
 def _run_sglang(
@@ -268,8 +302,10 @@ def _run_sglang(
 
     sglang's `n` is always 1 for the chat completion we use, so we
     map each prompt to one `_SglangRequestOutput`. The routed
-    experts come back via `meta_info.routed_experts`; we decode and
-    stash them on the shim's `outputs[0]`.
+    experts come back via `sglext.routed_experts` (sglang 0.5.x
+    OpenAI chat) or `meta_info.routed_experts` (older / completions);
+    we try both and slice off the trailing `n_shared` expert slots
+    so the result matches vLLM's `routed_experts` cardinality.
 
     `max_inflight` controls how many HTTP requests we have in flight
     at once. sglang's server does continuous batching internally, so
@@ -285,11 +321,8 @@ def _run_sglang(
         _read_model_config(model)
     )
     n_shared = _read_num_fused_shared_experts(model)
+    base_url, api_key = client
 
-    # Build chat-completion kwargs. The
-    # `return_routed_experts=True` extra field is the sglang
-    # extension; the OpenAI SDK forwards it as-is in the request
-    # body.
     out: list[_SglangRequestOutput] = [
         _SglangRequestOutput(prompt_token_ids=[], outputs=[])
         for _ in prompts
@@ -301,20 +334,13 @@ def _run_sglang(
     def _send_one(idx_prompt):
         idx, prompt = idx_prompt
         try:
-            resp = client.chat.completions.create(
+            data = _send_one_chat_completion(
+                base_url=base_url,
+                api_key=api_key,
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                prompt=prompt,
                 max_tokens=max_tokens,
-                temperature=0.0,
                 seed=seed,
-                extra_body={
-                    "return_routed_experts": True,
-                    # `routed_experts_start_len=0` means "from the
-                    # first token"; the default is 0 but we set it
-                    # explicitly so a future sglang default change
-                    # doesn't silently shift the capture window.
-                    "routed_experts_start_len": 0,
-                },
             )
         except Exception as e:
             logger.warning(
@@ -322,17 +348,16 @@ def _run_sglang(
             )
             return idx, _SglangRequestOutput(prompt_token_ids=[], outputs=[])
 
-        if not resp.choices:
+        if not data.get("choices"):
             return idx, _SglangRequestOutput(prompt_token_ids=[])
-        choice = resp.choices[0]
-        meta = getattr(choice, "model_extra", None) or {}
-        # sglang stuffs routed_experts in different places across versions.
-        # Try in order:
+
+        # sglang stuffs routed_experts in different places across
+        # versions. Try in order:
         #   1. top-level `sglext.routed_experts` (sglang 0.5.x OpenAI chat)
         #   2. `meta_info.routed_experts` inside choice (older sglang,
         #      completions endpoint)
         #   3. top-level `meta_info.routed_experts` (raw JSON dict)
-        sglext = meta.get("sglext") or {}
+        sglext = data.get("sglext") or {}
         if isinstance(sglext, dict) and sglext.get("routed_experts"):
             routed = _decode_routed_experts(
                 {"routed_experts": sglext["routed_experts"]},
@@ -342,7 +367,8 @@ def _run_sglang(
                 n_fused_shared_experts=n_shared,
             )
         else:
-            meta_info = meta.get("meta_info", meta)
+            choice = data["choices"][0]
+            meta_info = choice.get("meta_info") or choice
             routed = _decode_routed_experts(
                 meta_info,
                 num_layers=num_hidden_layers,
@@ -350,6 +376,7 @@ def _run_sglang(
                 top_k=num_experts_per_tok,
                 n_fused_shared_experts=n_shared,
             )
+
         # The completion text + token ids are not on the
         # OpenAI `Choice` object directly; we only need
         # `token_ids` for `aggregate_expert_counts`'s generated
@@ -358,14 +385,10 @@ def _run_sglang(
         # if available, else 0. This is good enough for the
         # routing-stats use case — the routed_experts tensor
         # is the real signal.
-        token_ids: list[int] = []
-        if getattr(choice, "message", None) is not None:
-            content = choice.message.content or ""
-            # Rough approximation: ~4 chars/token. The C++ binary
-            # counts exactly; we just want a magnitude for the
-            # totals.{tokens_total} field. The aggregate's
-            # `_generate_n` is only used for that field.
-            token_ids = [0] * max(1, len(content) // 4)
+        choice = data["choices"][0]
+        message = choice.get("message", {}) or {}
+        content = (message.get("content") or "")
+        token_ids: list[int] = [0] * max(1, len(content) // 4)
         return idx, _SglangRequestOutput(
             prompt_token_ids=[],  # OpenAI SDK doesn't surface this
             outputs=[
@@ -646,13 +669,22 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     client = _build_openai_client(args.server)
+    base_url, api_key = client  # _build_openai_client returns (base_url, api_key)
 
-    # Verify the server is alive.
+    # Verify the server is alive. We use httpx (not the openai SDK)
+    # because the SDK drops sglext on parse — see _build_openai_client.
     try:
-        models = client.models.list()
+        import httpx
+        r = httpx.get(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30.0,
+        )
+        r.raise_for_status()
+        model_ids = [m.get("id", "?") for m in r.json().get("data", [])]
         logger.info(
             "Connected to sglang server at %s; models: %s",
-            args.server, [m.id for m in models.data],
+            args.server, model_ids,
         )
     except Exception as e:
         logger.error("Could not reach sglang server at %s: %s", args.server, e)
