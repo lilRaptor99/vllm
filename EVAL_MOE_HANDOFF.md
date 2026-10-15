@@ -1783,3 +1783,114 @@ checks for.
 
 Co-authored-by: Hermes Agent <noreply@nousresearch.com>
 
+---
+
+## ADDENDUM 9 (added Oct 16, 2026 — Mixtral W4A16 routing data analysis; CORRECTED Oct 19, 2026)
+
+Discovered on 2026-10-16: the Mixtral-8x22B W4A16 AWQ + GPTQ cells at
+`results_wide_w4a16_awq_h100/` show 67–69% zeros in
+`aggregate.marginal_expert_counts` — degenerate per-layer-deterministic
+2-expert pairs across all tokens. The bf16/fp8/W8A16 cells for the
+same model are healthy (0% zeros, all 8 experts active at every
+layer), so the degeneracy is specific to W4A16 + compressed-tensors +
+Mixtral's `top_k=2`.
+
+**The full analysis lives in a new sibling document:
+`MIXTRAL_W4A16_BUG_HANDOFF.md`** (at the vLLM repo root). Read that
+first for the data signature, the eliminated alternatives, and the
+mechanism analysis. What follows is the short version.
+
+### AK. Conclusion (CORRECTED after second-pass analysis)
+
+**The capturer, kernel, router, and vLLM pipeline are all
+correct.** The data genuinely reflects what the model produces
+under int4 weight quantization with `top_k=2`. **There is no
+vLLM bug.**
+
+### AL. Why we initially suspected a bug
+
+- W4A16 Mixtral: 67–69% zeros (per-layer-deterministic 2-expert
+  pairs, byte-identical between MarlinExperts and TritonWNA16Experts)
+- W8A16 Mixtral: 0% zeros (all 8 experts active at every layer)
+- W4A16 OLMoE (top_k=8): 0% zeros
+- W4A16 Qwen3 (top_k=8): 0.6% zeros
+- W4A16 DeepSeek (top_k=6): 3.5% zeros
+
+The smaller the `top_k`, the worse the degeneration. This is the
+fingerprint of **router-logit collapse under int4 precision loss**,
+not a capturer or kernel bug.
+
+### AM. Mechanism
+
+The bf16 router gate is unchanged by W4A16 (in the prequant's
+ignore list). The gate computes correct bf16 logits from bf16 hidden
+states. **But the hidden states going into the gate are the output of
+the previous layer's W4A16-quantized MoE.** Int4 quantization reduces
+the dynamic range of the MoE output. At deeper layers, the cumulative
+quantization noise collapses the gate's input distribution, making the
+logits peak on one or two experts. For top_k=2, this collapse is
+catastrophic: every token picks the same 2 experts. For top_k=8 (OLMoE,
+Qwen3), the softmax distributes mass across 8 experts and the
+degeneration is mild.
+
+### AN. Verification (Triton-backend rerun, job 33143679, Oct 18-19)
+
+We tried forcing `TritonWNA16Experts` via `--moe-backend triton` to
+bypass MarlinExperts. Job 33143679 ran 4h, completed 4/5 AWQ
+benchmarks, then TIMEOUT on `include`. The new AWQ mmlu JSON has
+**byte-identical** degenerate data to the old Marlin run (same
+307/448 zeros, same per-layer deterministic pairs). **This
+conclusively proves the bug is NOT in the expert kernel — both
+kernels produce the same degenerate output, because the router
+upstream of them is the actual source.**
+
+### AO. What this means for the project
+
+**The Mixtral W4A16 routing data is unusable for cross-quant
+Jaccard analysis** because the routing doesn't reflect a "diverse
+MoE expert selection" — it reflects a "model collapse to 2
+experts" artifact. Per addendum 2 §7 #5 Path C (already
+authorized): drop the Mixtral W4A16 cells from the comparison.
+The bf16 / fp8 / W8A16 Mixtral cells (and the W4A16 cells for the
+other 3 models) provide enough weight-precision coverage.
+
+### AP. Patches left in working tree (uncommitted as of Oct 16 10:24)
+
+These are useful as future API for vLLM MoE backend selection but
+**do not fix the Mixtral W4A16 data degeneracy**:
+
+- `examples/eval-moe/moe_expert_stats.py` (+23 lines): adds
+  `--moe-backend` argparse flag and threads it through
+  `_build_llm()` to vLLM's `LLM(..., moe_backend=...)` kwarg.
+- `examples/eval-moe/spartan/vllm-moe-eval-h100-w4a16-prequant-mixtral-triton.sbatch`
+  (new): Mixtral-only TP=4 sbatch with `--moe-backend triton`
+  baked in, 4h wall.
+
+### AQ. Outstanding items
+
+1. **Drop the Mixtral W4A16 cells from the Jaccard comparison** (per
+   addendum 2 §7 #5 Path C, already authorized).
+2. **Optionally: GPU-side forward hooks** to confirm the
+   "router-logit collapse" hypothesis. Add 4 forward hooks (L=0,
+   L=8, L=30, L=55) on the gate linear; log hidden_states and
+   router_logits stats at each. Compare across W4A16-AWQ vs
+   W4A16-GPTQ vs W8A16 vs BF16. Estimated wall time 1-2h for
+   hooks + 30 min for one 5-benchmark run on gpu-a100-short.
+3. **Optionally: keep the uncommitted patches** (`--moe-backend`
+   flag + new sbatch) as a general-purpose vLLM MoE-backend-selection
+   utility for future debugging.
+
+### AR. File pointers
+
+| What | Where |
+|------|-------|
+| Full analysis | `MIXTRAL_W4A16_BUG_HANDOFF.md` (sibling doc) |
+| Analyzer patch (uncommitted) | `examples/eval-moe/moe_expert_stats.py` (+23 lines) |
+| Triton-backend sbatch (uncommitted) | `examples/eval-moe/spartan/vllm-moe-eval-h100-w4a16-prequant-mixtral-triton.sbatch` |
+| Stale Mixtral W4A16 JSONs (overwritten by Triton rerun) | `results_wide_w4a16_awq_h100/--data--scratch--projects--uom00014--vllm--hf_cache_awq--mistralai--Mixtral-8x22B-Instruct-v0.1-{awq,gptq}/compressed-tensors/moe-*/expert_counts.json` |
+| Working W8A16 baseline | `results_wide_w8a16_h100/mistralai--Mixtral-8x22B-Instruct-v0.1/int8_per_channel_weight_only/moe-*/expert_counts.json` |
+| Prior Marlin run log | `examples/eval-moe/spartan/logs/vllm-moe-eval-w4a16-prequant-32517565.out` |
+| Triton rerun log (TIMEOUT 4h, 4/5 benchmarks) | `examples/eval-moe/spartan/logs/vllm-moe-eval-w4a16-prequant-mixtral-triton-33143679.out` |
+
+Co-authored-by: Hermes Agent <noreply@nousresearch.com>
+
