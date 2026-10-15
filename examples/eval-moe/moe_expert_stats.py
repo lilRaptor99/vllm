@@ -1030,6 +1030,7 @@ def _build_llm(
     seed: int,
     tensor_parallel_size: int = 1,
     hf_overrides: dict[str, Any] | None = None,
+    moe_backend: str | None = None,
 ) -> Any:
     """Instantiate a fresh vLLM `LLM` for one (model, quant) cell.
 
@@ -1046,6 +1047,13 @@ def _build_llm(
     `trust_remote_code=True` is forwarded so architectures that ship
     custom modeling code on the Hub (e.g. DeepSeek-MoE) load without an
     interactive prompt — SLURM jobs have no TTY, so a prompt would EOF.
+
+    `moe_backend` is forwarded to vLLM's `moe_backend` config so the
+    WNA16 oracle picks a specific kernel (e.g. ``"triton"`` to skip
+    Marlin — which currently produces degenerate routed-experts
+    capture for Mixtral's top_k=2 on H100, see addendum 9 of
+    EVAL_MOE_HANDOFF.md). Pass ``None`` (the default) to use vLLM's
+    automatic selection.
     """
     from vllm import LLM
 
@@ -1064,6 +1072,8 @@ def _build_llm(
         kwargs["quantization"] = quant
     if hf_overrides:
         kwargs["hf_overrides"] = hf_overrides
+    if moe_backend:
+        kwargs["moe_backend"] = moe_backend
     return LLM(**kwargs)
 
 
@@ -1457,6 +1467,18 @@ def _parse_args() -> argparse.Namespace:
             "without modifying the model's config.json on scratch."
         ),
     )
+    parser.add_argument(
+        "--moe-backend",
+        default=None,
+        help=(
+            "Override vLLM's MoE backend selection (passed through to "
+            "the WNA16 oracle). Leave unset (=None) to use vLLM's "
+            "automatic selection. Set to e.g. 'triton' to skip Marlin "
+            "for W4A16 cells where Marlin produces degenerate routed-"
+            "experts capture data on H100 (see EVAL_MOE_HANDOFF.md "
+            "addendum 9 — Mixtral top_k=2 W4A16 cells)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1562,6 +1584,7 @@ def _run_one_cell(
             json.loads(args.hf_overrides)
             if args.hf_overrides else None
         ),
+        moe_backend=args.moe_backend,
     )
 
     # Tokenizer for per-prompt prefill counts (so the

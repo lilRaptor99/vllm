@@ -1783,3 +1783,83 @@ checks for.
 
 Co-authored-by: Hermes Agent <noreply@nousresearch.com>
 
+---
+
+## ADDENDUM 9 (added Oct 16, 2026 — Mixtral W4A16 routed-experts capturer bug)
+
+Discovered on 2026-10-16: the Mixtral-8x22B W4A16 AWQ + GPTQ cells at
+`results_wide_w4a16_awq_h100/` show 67–69% zeros in
+`aggregate.marginal_expert_counts` — degenerate per-layer-deterministic
+2-expert pairs across all tokens. The bf16/fp8/W8A16 cells for the
+same model are healthy (0% zeros, all 8 experts active at every
+layer), so the bug is specific to W4A16 + compressed-tensors +
+MarlinExperts on Mixtral's `top_k=2`.
+
+**The full diagnosis lives in a new sibling document:
+`MIXTRAL_W4A16_BUG_HANDOFF.md`** (at the vLLM repo root). Read that
+first for the data signature, the eliminated alternatives, and the
+verification recipe. What follows is the short version.
+
+### AK. TL;DR
+
+- **Prequant ckpt is correct** (56 bf16 router gates intact, 2.5k
+  unique values per gate, range [-0.14, 0.13]).
+- **Other models on the W4A16 path are healthy**: OLMoE 0/1024,
+  Qwen3 44/6144 (sparse top-k but consistent), DeepSeek 63/1792.
+- **My initial suspect (`TrtLlmMxint4ExpertsMonolithic`) is NOT the
+  culprit**: that kernel requires `is_device_capability_family(100)`
+  (Blackwell) and Spartan is sm_90. The actual kernel on H100 is
+  `MarlinExperts` (logged at `int_wna16.py:409`), which is
+  `FusedMoEExpertsModular` (non-monolithic). The capturer binds via
+  `BaseRouter.set_capture_fn`, so the binding is correct — but the
+  `topk_ids` returned for layers 8–55 of Mixtral W4A16 are
+  deterministic per-layer pairs (e.g. `(E0, E6)` at L=8 and L=12,
+  `(E4, E5)` at L=10). Root cause is most likely a MarlinExperts +
+  Mixtral top_k=2 specific bug (likely the `moe_align_block_size`
+  step with `block_size = min(top_k, 4) = 2`).
+- **Fix in flight**: force `TritonWNA16Experts` instead of
+  MarlinExperts via vLLM's `moe_backend="triton"` kwarg. Triton's
+  WNA16 path uses the same BaseRouter capture_fn plumbing that
+  already produces healthy data for W8A16 `TritonExperts`.
+- **Test job**: 33143679 (PENDING on gpu-h100 at 2026-10-16 10:24
+  AEST). Mixtral × {AWQ, GPTQ} × 5 benchmarks at TP=4, 4h wall.
+
+### AL. Patches in working tree (uncommitted as of Oct 16 10:24)
+
+- `examples/eval-moe/moe_expert_stats.py` (+23 lines): adds
+  `--moe-backend` argparse flag and threads it through
+  `_build_llm()` to vLLM's `LLM(..., moe_backend=...)` kwarg.
+- `examples/eval-moe/spartan/vllm-moe-eval-h100-w4a16-prequant-mixtral-triton.sbatch`
+  (new file): Mixtral-only TP=4 with `--moe-backend triton` baked
+  in, auto-wipes the 10 stale Mixtral JSONs before running,
+  pre-flight guard verifies the analyzer has the `--moe-backend`
+  flag.
+
+### AM. Outstanding items
+
+See `MIXTRAL_W4A16_BUG_HANDOFF.md` §7 for the full list. Short
+version:
+
+1. Verify job 33143679 produces healthy capturer data
+   (zeros < 20%, all 8 experts active per layer).
+2. If healthy: file upstream vllm issue with the workaround.
+3. If unhealthy: in-tree patch to `int_wna16.py:280-298` to skip
+   MarlinExperts for top_k=2 on sm_90 (Option B in the bug
+   handoff).
+4. Re-run the sister-repo Jaccard aggregator with the new Mixtral
+   W4A16 cells once they're healthy.
+
+### AN. File pointers
+
+| What | Where |
+|------|-------|
+| Full diagnosis | `MIXTRAL_W4A16_BUG_HANDOFF.md` (sibling doc, 16 KB) |
+| Analyzer patch | `examples/eval-moe/moe_expert_stats.py` (+23 lines) |
+| Triton-backend sbatch | `examples/eval-moe/spartan/vllm-moe-eval-h100-w4a16-prequant-mixtral-triton.sbatch` |
+| Stale JSONs | `results_wide_w4a16_awq_h100/--data--scratch--projects--uom00014--vllm--hf_cache_awq--mistralai--Mixtral-8x22B-Instruct-v0.1-{awq,gptq}/compressed-tensors/moe-*/expert_counts.json` |
+| Working W8A16 baseline | `results_wide_w8a16_h100/mistralai--Mixtral-8x22B-Instruct-v0.1/int8_per_channel_weight_only/moe-*/expert_counts.json` |
+| Prior MarlinExperts run log | `examples/eval-moe/spartan/logs/vllm-moe-eval-w4a16-prequant-32517565.out` |
+| In-flight Triton run log | `examples/eval-moe/spartan/logs/vllm-moe-eval-w4a16-prequant-mixtral-triton-33143679.out` |
+
+Co-authored-by: Hermes Agent <noreply@nousresearch.com>
+
