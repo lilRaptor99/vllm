@@ -2,6 +2,10 @@
 
 This directory contains the first-pass, low-volume validation flow for a 4x H100 BF16 Mixtral run, followed by the full sweep once the smoke test passes.
 
+> **For the full background, gotchas, change log, and runbook** see
+> [HANDOFF.md](HANDOFF.md) (725 lines). This README is the
+> quick-start; the handoff is the authoritative reference.
+
 ## Phase 0: prepare the VM before the GPU test
 
 Run this first on the VM that will eventually become the 4x H100 machine:
