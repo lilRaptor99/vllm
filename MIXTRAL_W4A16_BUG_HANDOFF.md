@@ -301,4 +301,69 @@ The data confirms there is no capturer bug. The "fix" was
 attempting to work around a vLLM internal that wasn't actually
 broken. Future debugging time is better spent elsewhere.
 
+## 8. Follow-up: HF-based rerun (Oct 19, 2026)
+
+The user found two HuggingFace prequantized Mixtral weights
+(`mistral-community/Mixtral-8x22B-v0.1-AWQ` and
+`jarrelscy/Mixtral-8x22B-Instruct-v0.1-GPTQ-4bit`) and asked us
+to delete the 3 local prequant ckpts and re-run the analyzer
+with the HF weights instead. Hypothesis: maybe the local
+prequant recipe was the problem (a subtle difference in how
+the gate was preserved or the weights were packed), and a
+different prequantizer would produce healthy routing data.
+
+**Actions taken (Oct 19)**:
+- Deleted 3 local prequant dirs (~219 GB) under
+  `${SCRATCH}/hf_cache_awq/mistralai--Mixtral-8x22B-Instruct-v0.1-{awq,awq_gptq,gptq}/`
+- Pre-staged 2 HF model dirs (~138 GB) under `${SCRATCH}/hf_cache/`
+  via `huggingface_hub.snapshot_download` (login-node pre-stage
+  via `sbatch`; see the helper at
+  `examples/eval-moe/spartan/download-hf-model.sbatch`):
+    - `models--MaziyarPanahi--Mixtral-8x22B-Instruct-v0.1-AWQ/`
+      (Instruct AWQ — note: user asked for the **Instruct** variant,
+      not the base v0.1 from `mistral-community/...`. The two differ
+      in `vocab_size` (32000 vs 32768) and the base model id in
+      `_name_or_path`.)
+    - `models--jarrelscy--Mixtral-8x22B-Instruct-v0.1-GPTQ-4bit/`
+      (Instruct GPTQ)
+- Submitted 2 analyzer jobs in parallel (both PENDING on gpu-h100
+  at the same time, so they can start as soon as 2 separate H100
+  nodes free up):
+    - **33405490** (Instruct AWQ) →
+      `${SCRATCH}/results_wide_w4a16_hf_h100/`
+    - **33416017** (Instruct GPTQ) →
+      `${SCRATCH}/results_wide_w4a16_hf_h100_gptq/`
+  Each job is 1 model × 5 benchmarks = 5 cells, 4 GPUs (TP=4),
+  8h wall.
+- Deleted the 4 stale Mixtral W4A16 expert_counts.json files
+  from the legacy `results_wide_w4a16_awq_h100/`
+
+**What the new sbatch does**:
+- `MODELS_OVERRIDE=MaziyarPanahi/Mixtral-8x22B-Instruct-v0.1-AWQ`
+  (default; pass `jarrelscy/Mixtral-8x22B-Instruct-v0.1-GPTQ-4bit`
+  via `--export` to run GPTQ in a follow-up — see the GPTQ job
+  33416017 above)
+- `HF_HUB_OFFLINE=1` so the GPU node doesn't try to reach HF
+- `--quant ` (empty) — let vLLM auto-detect from each HF config
+  (awq_marlin for AWQ, gptq_marlin for GPTQ)
+- **No `--moe-backend` override** — the Triton workaround was
+  a dead end
+- `OUTPUT_DIR=${SCRATCH}/results_wide_w4a16_hf_h100/` (new dir;
+  doesn't overwrite the 3 other models' W4A16 results; the GPTQ
+  run uses `results_wide_w4a16_hf_h100_gptq/`)
+
+**If the new run produces healthy data (zeros < 20%, all 8 experts
+active at every layer)**: confirms the issue is in the local
+prequant recipe (some subtle property of the gate or the
+weight-packing that was specific to our `awq_quantize.py`
+config). The new cells go into the Jaccard matrix, and the
+research question can be answered.
+
+**If the new run produces byte-identical degenerate data to the
+old run**: confirms the issue is intrinsic to W4A16 + Mixtral's
+top_k=2 (the "router-logit collapse under int4 precision loss"
+hypothesis in §3.1 is correct), and the Mixtral W4A16 cells
+should stay out of the Jaccard comparison (per addendum 2 §7 #5
+Path C).
+
 Co-authored-by: Hermes Agent <noreply@nousresearch.com>
