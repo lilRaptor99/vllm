@@ -47,6 +47,8 @@
 #SBATCH --time=8:00:00
 #SBATCH --output=spartan/logs/vllm-moe-eval-w4a16-hf-mixtral-tp4-%j.out
 #SBATCH --error=spartan/logs/vllm-moe-eval-w4a16-hf-mixtral-tp4-%j.err
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=pratheek.senevirathne@student.unimelb.edu.au
 #SBATCH --export=ALL
 #SBATCH --signal=B:SIGTERM@60
 
@@ -57,7 +59,12 @@ shopt -s nullglob
 GCC_MODULE="${GCC_MODULE:-GCCcore/11.3.0}"
 PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.3}"
 CUDA_MODULE="${CUDA_MODULE:-CUDA/12.4.1}"
-NCCL_MODULE="${NCCL_MODULE:-NCCL/2.18.3-GCCcore-11.3.0}"
+# NCCL/2.18.3-GCCcore-11.3.0 does not exist on Spartan — `module spider
+# NCCL` lists only CUDA-suffixed builds (2.12.12-CUDA-11.7.0 through
+# 2.27.7-CUDA-12.8.0). Use the same NCCL/2.22.3-CUDA-12.4.1 that every
+# other vLLM sbatch in this repo uses; loading a missing module is a
+# hard [fatal] exit 3 in this script.
+NCCL_MODULE="${NCCL_MODULE:-NCCL/2.22.3-CUDA-12.4.1}"
 # Ninja must match the active Python module — module load puts
 # ninja on $PATH for the parent and all forked children. The
 # default `Ninja/1.11.1-Python-3.11.3` matches Python/3.11.3.
@@ -150,9 +157,18 @@ echo "============================================================"
 # cache-must-have-config check below catches "forgot to run
 # `hf download`" before we burn 8h on a job that can't find its
 # inputs.
+# HF Hub cache layout is `models--ORG--REPO/` (each `/` becomes `-`
+# AND a `--` separator is inserted between components). For a model
+# id like `MaziyarPanahi/Mixtral-8x22B-Instruct-v0.1-AWQ` the on-disk
+# path is `models--MaziyarPanahi--Mixtral-8x22B-Instruct-v0.1-AWQ` —
+# note the DOUBLE dash between org and repo. Building that from the
+# model id with `tr '/' '-'` (single dash) or `awk '{print $1 "-" $2}'`
+# produces the WRONG path; the preflight then exits 3 in 2 seconds
+# even though the weights are perfectly pre-staged. Using bash
+# parameter expansion to replace every '/' with '--' produces the
+# canonical HF Hub cache path correctly.
 for m in ${MODELS_OVERRIDE}; do
-    HF_SAFE=$(echo "${m}" | tr '/' '-')
-    HF_DIR="${HF_CACHE}/models--${HF_SAFE}"
+    HF_DIR="${HF_CACHE}/models--${m//\//--}"
     HF_SNAP="${HF_DIR}/snapshots"
     if [[ ! -d "${HF_SNAP}" ]]; then
         echo "[fatal] ${m} is not pre-staged under ${HF_DIR}" >&2
